@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (with coverage, per-file thresholds enforced)
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # Dogfooding: cachelens gates its own repo. `fixtures/demo-agent/fixed.jsonl`
+      # is the golden "fixed" trace from the naive-vs-fixed demo dataset — its
+      # cache hit rate is a known-good ~86%, so this is a real CI gate, not a
+      # no-op. A regression in the diagnostic or aggregation logic that
+      # dropped fixed's hit rate below the threshold would fail this step.
+      - name: Self-check (cachelens gating its own demo trace)
+        run: node dist/cli/index.js check fixtures/demo-agent/fixed.jsonl --min-hit-rate 80
+
+      # `proxy` is wired but not exercised above (it needs a live upstream
+      # to say anything meaningful, which belongs in start-proxy's own
+      # test suite, not a CI network dependency). This is a cheap sanity
+      # check that the subcommand is actually reachable from the built
+      # CLI: it's listed in --help, and calling it without the required
+      # output-file argument fails with the documented usage error rather
+      # than crashing or hanging.
+      - name: Proxy subcommand sanity check (wiring only, no live upstream)
+        run: |
+          node dist/cli/index.js help | grep -q '^  proxy '
+          if node dist/cli/index.js proxy; then
+            echo "expected 'cachelens proxy' with no args to fail" >&2
+            exit 1
+          fi

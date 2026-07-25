@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+
+# Trace payloads are local-only (may contain redacted-but-sensitive prompt data)
+*.jsonl
+!fixtures/**/*.jsonl
+cachelens.db
+cachelens.db-*
