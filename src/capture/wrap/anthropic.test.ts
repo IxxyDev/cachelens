@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { diffParams } from "../../core/diff/params-diff.js";
 import { MemoryTraceStore } from "../../store/memory-store.js";
 import {
   type FetchLike,
@@ -264,39 +265,73 @@ describe("parseRequestParams", () => {
       toolChoice: "auto"
     });
   });
-  it("extracts an object tool_choice by its type", () => {
+  it("makes a switch of the forced tool visible to the params diff", () => {
+    const forced = (name: string) =>
+      parseRequestParams(requestBody({ tool_choice: { type: "tool", name } }));
+    expect(diffParams(forced("get_weather"), forced("get_time"))).toBe("messages");
+  });
+  it("extracts an object tool_choice as type plus forced tool name", () => {
     expect(
       parseRequestParams(requestBody({ tool_choice: { type: "tool", name: "get_weather" } }))
-    ).toEqual({ model: "claude-opus-4-8", toolChoice: "tool" });
-  });
-  it("marks thinking enabled for a non-disabled thinking config", () => {
-    expect(parseRequestParams(requestBody({ thinking: { type: "adaptive" } }))).toEqual({
+    ).toEqual({ model: "claude-opus-4-8", toolChoice: "tool:get_weather" });
+    expect(parseRequestParams(requestBody({ tool_choice: { type: "any" } }))).toEqual({
       model: "claude-opus-4-8",
-      thinking: true
+      toolChoice: "any"
     });
   });
-  it("marks thinking disabled explicitly", () => {
+  it("extracts an adaptive thinking config", () => {
+    expect(parseRequestParams(requestBody({ thinking: { type: "adaptive" } }))).toEqual({
+      model: "claude-opus-4-8",
+      thinking: { type: "adaptive" }
+    });
+  });
+  it("extracts a disabled thinking config", () => {
     expect(parseRequestParams(requestBody({ thinking: { type: "disabled" } }))).toEqual({
       model: "claude-opus-4-8",
-      thinking: false
+      thinking: { type: "disabled" }
     });
   });
   it("omits thinking when absent from the request", () => {
     const params = parseRequestParams(requestBody());
     expect("thinking" in params).toBe(false);
   });
-  it("extracts thinking.budget_tokens alongside the enabled flag", () => {
+  it("extracts thinking.budget_tokens for an enabled thinking config", () => {
     expect(
       parseRequestParams(requestBody({ thinking: { type: "enabled", budget_tokens: 8000 } }))
     ).toEqual({
       model: "claude-opus-4-8",
-      thinking: true,
-      thinkingBudgetTokens: 8000
+      thinking: { type: "enabled", budgetTokens: 8000 }
     });
   });
-  it("omits thinkingBudgetTokens when the thinking config has no budget_tokens", () => {
+  it("omits budgetTokens when the thinking config has no budget_tokens", () => {
     const params = parseRequestParams(requestBody({ thinking: { type: "adaptive" } }));
-    expect("thinkingBudgetTokens" in params).toBe(false);
+    expect(params.thinking && "budgetTokens" in params.thinking).toBe(false);
+  });
+  it("extracts output_config.effort", () => {
+    expect(parseRequestParams(requestBody({ output_config: { effort: "low" } }))).toEqual({
+      model: "claude-opus-4-8",
+      effort: "low"
+    });
+  });
+  it("extracts context_management as key-order-independent JSON", () => {
+    const a = parseRequestParams(
+      requestBody({ context_management: { edits: [{ type: "clear_tool_uses", keep: 3 }] } })
+    );
+    const b = parseRequestParams(
+      requestBody({ context_management: { edits: [{ keep: 3, type: "clear_tool_uses" }] } })
+    );
+    expect(a.contextManagement).toBe('{"edits":[{"keep":3,"type":"clear_tool_uses"}]}');
+    expect(b.contextManagement).toBe(a.contextManagement);
+  });
+  it("extracts inference_geo", () => {
+    expect(parseRequestParams(requestBody({ inference_geo: "us" })).inferenceGeo).toBe("us");
+  });
+  it("marks webSearchEnabled when a web_search server tool is present", () => {
+    const params = parseRequestParams(
+      requestBody({ tools: [{ type: "web_search_20250305", name: "web_search" }] })
+    );
+    expect(params.webSearchEnabled).toBe(true);
+    expect("webSearchEnabled" in parseRequestParams(requestBody())).toBe(false);
   });
   it("extracts the top-level speed field", () => {
     expect(parseRequestParams(requestBody({ speed: "fast" }))).toEqual({

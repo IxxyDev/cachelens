@@ -165,7 +165,7 @@ describe("diagnoseCall", () => {
     expect(result.diagnosis.cause).toBe("request-param-invalidation");
     expect(result.diagnosis.invalidatedTiers).toEqual(["tools", "system", "messages"]);
   });
-  it("a thinking change invalidates system+messages but not tools", () => {
+  it("a thinking change invalidates messages (tools/system only model-specific)", () => {
     const wireBody = {
       tools: [{ name: "search" }],
       system: "x",
@@ -174,20 +174,20 @@ describe("diagnoseCall", () => {
     const previous = makeCall({
       wireBody,
       timestamp: 0,
-      requestParams: { thinking: false },
+      requestParams: { thinking: { type: "disabled" } },
       usage: { cacheReadInputTokens: tokenCount(300) }
     });
     const current = makeCall({
       wireBody,
       timestamp: GAP_MS,
-      requestParams: { thinking: true },
+      requestParams: { thinking: { type: "adaptive" } },
       usage: { cacheCreationInputTokens: tokenCount(300) }
     });
     const result = diagnoseCall(previous, current);
     expect(result.kind).toBe("diagnosis");
     if (result.kind !== "diagnosis") throw new Error("expected a diagnosis");
     expect(result.diagnosis.cause).toBe("request-param-invalidation");
-    expect(result.diagnosis.invalidatedTiers).toEqual(["system", "messages"]);
+    expect(result.diagnosis.invalidatedTiers).toEqual(["messages"]);
   });
   it("detects nondeterministic-serialization when only tool key order differs", () => {
     const makeTools = (schema: Record<string, unknown>) => [

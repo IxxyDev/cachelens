@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { LlmCall, RequestParams, Usage } from "../../core/model/call.js";
+import { normalizeSortedKeys } from "../../core/diff/normalize.js";
+import type {
+  LlmCall,
+  RequestParams,
+  ThinkingParams,
+  ThinkingType,
+  Usage
+} from "../../core/model/call.js";
 import { tokenCount } from "../../core/model/types.js";
 import type { TraceStore } from "../../store/trace-store.js";
 import { redactWireBody } from "../redact.js";
@@ -129,7 +136,11 @@ interface RawRequestBody {
   readonly model?: unknown;
   readonly tool_choice?: unknown;
   readonly thinking?: unknown;
+  readonly output_config?: unknown;
+  readonly context_management?: unknown;
+  readonly inference_geo?: unknown;
   readonly speed?: unknown;
+  readonly tools?: unknown;
   readonly messages?: unknown;
   readonly system?: unknown;
 }
@@ -147,8 +158,16 @@ export function parseRequestParams(wireBody: string): RequestParams {
   const model = typeof body.model === "string" ? body.model : "unknown";
   const toolChoice = describeToolChoice(body.tool_choice);
   const thinking = describeThinking(body.thinking);
-  const thinkingBudgetTokens = describeThinkingBudget(body.thinking);
-  const speed = typeof body.speed === "string" ? body.speed : undefined;
+  const effort = readString(
+    (body.output_config as { readonly effort?: unknown } | null | undefined)?.effort
+  );
+  const contextManagement =
+    body.context_management === undefined
+      ? undefined
+      : JSON.stringify(normalizeSortedKeys(body.context_management));
+  const inferenceGeo = readString(body.inference_geo);
+  const speed = readString(body.speed);
+  const webSearchEnabled = isWebSearchPresent(body.tools) || undefined;
   const blocks = collectContentBlocks(body);
   const imagesPresent = blocks.some((block) => block.type === "image") || undefined;
   const citationsEnabled = blocks.some((block) => isCitationsEnabled(block.citations)) || undefined;
@@ -156,10 +175,13 @@ export function parseRequestParams(wireBody: string): RequestParams {
     model,
     ...(toolChoice !== undefined ? { toolChoice } : {}),
     ...(thinking !== undefined ? { thinking } : {}),
-    ...(thinkingBudgetTokens !== undefined ? { thinkingBudgetTokens } : {}),
+    ...(effort !== undefined ? { effort } : {}),
+    ...(contextManagement !== undefined ? { contextManagement } : {}),
+    ...(inferenceGeo !== undefined ? { inferenceGeo } : {}),
     ...(speed !== undefined ? { speed } : {}),
     ...(imagesPresent !== undefined ? { imagesPresent } : {}),
-    ...(citationsEnabled !== undefined ? { citationsEnabled } : {})
+    ...(citationsEnabled !== undefined ? { citationsEnabled } : {}),
+    ...(webSearchEnabled !== undefined ? { webSearchEnabled } : {})
   };
 }
 interface RawContentBlock {
@@ -203,16 +225,17 @@ function isCitationsEnabled(value: unknown): boolean {
     ).enabled === true
   );
 }
+/**
+ * `tool_choice` as one comparable string: the type, plus `:<name>` for a forced tool
+ * (`{ type: "tool", name: "x" }` -> `"tool:x"`), so switching the forced tool is a param change.
+ */
 function describeToolChoice(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value === "string") return value;
   if (value !== null && typeof value === "object" && "type" in value) {
-    const type = (
-      value as {
-        type: unknown;
-      }
-    ).type;
-    return typeof type === "string" ? type : JSON.stringify(value);
+    const { type, name } = value as { readonly type: unknown; readonly name?: unknown };
+    if (typeof type !== "string") return JSON.stringify(value);
+    return typeof name === "string" ? `${type}:${name}` : type;
   }
   return JSON.stringify(value);
 }
@@ -220,16 +243,23 @@ interface RawThinking {
   readonly type?: unknown;
   readonly budget_tokens?: unknown;
 }
-function describeThinking(value: unknown): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || typeof value !== "object") return undefined;
-  const type = (value as RawThinking).type;
-  return type !== "disabled";
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
-function describeThinkingBudget(value: unknown): number | undefined {
+function isWebSearchPresent(tools: unknown): boolean {
+  if (!Array.isArray(tools)) return false;
+  return tools.some((tool) => {
+    const type = (tool as { readonly type?: unknown } | null)?.type;
+    return typeof type === "string" && type.startsWith("web_search");
+  });
+}
+function describeThinking(value: unknown): ThinkingParams | undefined {
   if (value === null || typeof value !== "object") return undefined;
-  const budget = (value as RawThinking).budget_tokens;
-  return typeof budget === "number" ? budget : undefined;
+  const raw = value as RawThinking;
+  const type: ThinkingType =
+    raw.type === "adaptive" || raw.type === "disabled" ? raw.type : "enabled";
+  const budgetTokens = typeof raw.budget_tokens === "number" ? raw.budget_tokens : undefined;
+  return budgetTokens !== undefined ? { type, budgetTokens } : { type };
 }
 export function wrapAnthropic<TClient>(
   createClient: (fetch: FetchLike) => TClient,

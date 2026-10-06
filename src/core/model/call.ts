@@ -10,21 +10,28 @@ export interface Usage {
   /** Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`, when reported. */
   readonly cacheCreation1hInputTokens?: TokenCount;
 }
+export type ThinkingType = "adaptive" | "enabled" | "disabled";
+export interface ThinkingParams {
+  readonly type: ThinkingType;
+  readonly budgetTokens?: number;
+}
 export interface RequestParams {
   readonly model: string;
   readonly toolChoice?: string;
-  readonly thinking?: boolean;
-  readonly thinkingBudgetTokens?: number;
+  readonly thinking?: ThinkingParams;
+  /** `output_config.effort`. */
+  readonly effort?: string;
+  /** Stable (sorted-key) JSON of `context_management`. */
+  readonly contextManagement?: string;
+  readonly inferenceGeo?: string;
   readonly speed?: string;
   readonly imagesPresent?: boolean;
   readonly citationsEnabled?: boolean;
+  /** A server `web_search` tool is present in `tools`. */
+  readonly webSearchEnabled?: boolean;
 }
 export interface RequestPayload {
   readonly wireBody: string;
-}
-export interface Step {
-  readonly name: string;
-  readonly parentCallId?: string;
 }
 export interface LlmCall {
   readonly id: string;

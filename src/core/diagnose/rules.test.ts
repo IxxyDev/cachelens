@@ -53,20 +53,25 @@ describe("checkRequestParamInvalidation wastedUsdByTier", () => {
     expect(diagnosis.wastedUsdByTier.get("messages")).toBeGreaterThan(0);
     expect(sumMap(diagnosis.wastedUsdByTier)).toBeCloseTo(diagnosis.wastedUsd, 6);
   });
-  it("zeroes the tools tier when only tool_choice/thinking changed (system+messages scope)", () => {
+  it("zeroes the tools and system tiers when only thinking changed (messages scope, upstream model-specific)", () => {
     const wireBody = {
       tools: [{ name: "search" }],
       system: "x",
       messages: [{ role: "user", content: "hi" }]
     };
     const previous = makeCall(wireBody, {
-      params: { model: "claude-sonnet-4-5", thinking: false }
+      params: { model: "claude-sonnet-4-5", thinking: { type: "disabled" } }
     });
-    const current = makeCall(wireBody, { params: { model: "claude-sonnet-4-5", thinking: true } });
+    const current = makeCall(wireBody, {
+      params: { model: "claude-sonnet-4-5", thinking: { type: "adaptive" } }
+    });
     const diagnosis = checkRequestParamInvalidation(previous, current, pricing);
     expect(diagnosis).not.toBeNull();
     if (!diagnosis) throw new Error("expected a diagnosis");
+    expect(diagnosis.invalidatedTiers).toEqual(["messages"]);
     expect(diagnosis.wastedUsdByTier.get("tools")).toBe(0);
+    expect(diagnosis.wastedUsdByTier.get("system")).toBe(0);
+    expect(diagnosis.excerpt).toBe("thinking: disabled -> adaptive");
     expect(sumMap(diagnosis.wastedUsdByTier)).toBeCloseTo(diagnosis.wastedUsd, 6);
   });
 });
@@ -74,10 +79,10 @@ describe("checkRequestParamInvalidation excerpt", () => {
   it("describes a budget_tokens-only change distinctly from a generic 'params changed' message", () => {
     const wireBody = { tools: [], system: "x", messages: [] };
     const previous = makeCall(wireBody, {
-      params: { model: "claude-sonnet-4-5", thinking: true, thinkingBudgetTokens: 8000 }
+      params: { model: "claude-sonnet-4-5", thinking: { type: "enabled", budgetTokens: 8000 } }
     });
     const current = makeCall(wireBody, {
-      params: { model: "claude-sonnet-4-5", thinking: true, thinkingBudgetTokens: 16000 }
+      params: { model: "claude-sonnet-4-5", thinking: { type: "enabled", budgetTokens: 16000 } }
     });
     const diagnosis = checkRequestParamInvalidation(previous, current, pricing);
     expect(diagnosis).not.toBeNull();

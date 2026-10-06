@@ -73,7 +73,11 @@ export function checkRequestParamInvalidation(
     return null;
   }
   const invalidatedTiers: CacheTier[] =
-    scope === "all" ? ["tools", "system", "messages"] : ["system", "messages"];
+    scope === "all"
+      ? ["tools", "system", "messages"]
+      : scope === "system-and-messages"
+        ? ["system", "messages"]
+        : ["messages"];
   const tierByteLengths = tierByteLengthsFromWireBody(current.payload.wireBody);
   return {
     cause: "request-param-invalidation",
@@ -90,11 +94,24 @@ export function checkRequestParamInvalidation(
       pricing,
       ttl: "5m"
     }).wastedUsdByTier,
-    recommendation:
-      scope === "all"
-        ? "Keep `model` (and tool definitions) fixed for this step — a model change invalidates the entire cache prefix, all tiers."
-        : "Fix `tool_choice`/`thinking` for this step, or move whichever varies below the cache breakpoint — these invalidate system+messages, but tools can survive."
+    recommendation: PARAM_SCOPE_RECOMMENDATION[scope]
   };
+}
+const PARAM_SCOPE_RECOMMENDATION: Readonly<
+  Record<Exclude<ReturnType<typeof diffParams>, "none">, string>
+> = {
+  all: "Keep `model` (and tool definitions) fixed for this step — a model change invalidates the entire cache prefix, all tiers.",
+  "system-and-messages":
+    "Keep `speed`, web search and citations fixed for this step — toggling them invalidates system+messages, but tools can survive.",
+  "messages-maybe-upstream":
+    "Keep `thinking` and `output_config.effort` fixed for this step — changing them invalidates the messages cache, and on some models tools+system too.",
+  messages:
+    "Keep `tool_choice`, images and `context_management` stable for this step — changing them invalidates the messages cache; tools and system survive."
+};
+function describeThinking(params: RequestParams): string {
+  if (!params.thinking) return "undefined";
+  const budget = params.thinking.budgetTokens;
+  return budget === undefined ? params.thinking.type : `${params.thinking.type}/${budget}`;
 }
 function describeParamChange(previous: RequestParams, current: RequestParams): string {
   if (previous.model !== current.model) {
@@ -103,11 +120,23 @@ function describeParamChange(previous: RequestParams, current: RequestParams): s
   if (previous.toolChoice !== current.toolChoice) {
     return `tool_choice: ${JSON.stringify(previous.toolChoice)} -> ${JSON.stringify(current.toolChoice)}`;
   }
-  if (previous.thinking !== current.thinking) {
-    return `thinking: ${String(previous.thinking)} -> ${String(current.thinking)}`;
+  if (previous.inferenceGeo !== current.inferenceGeo) {
+    return `inference_geo: ${String(previous.inferenceGeo)} -> ${String(current.inferenceGeo)}`;
   }
-  if (previous.thinkingBudgetTokens !== current.thinkingBudgetTokens) {
-    return `thinking.budget_tokens: ${String(previous.thinkingBudgetTokens)} -> ${String(current.thinkingBudgetTokens)}`;
+  if (previous.thinking?.type !== current.thinking?.type) {
+    return `thinking: ${describeThinking(previous)} -> ${describeThinking(current)}`;
+  }
+  if (previous.thinking?.budgetTokens !== current.thinking?.budgetTokens) {
+    return `thinking.budget_tokens: ${String(previous.thinking?.budgetTokens)} -> ${String(current.thinking?.budgetTokens)}`;
+  }
+  if (previous.effort !== current.effort) {
+    return `output_config.effort: ${String(previous.effort)} -> ${String(current.effort)}`;
+  }
+  if (previous.contextManagement !== current.contextManagement) {
+    return `context_management: ${String(previous.contextManagement)} -> ${String(current.contextManagement)}`;
+  }
+  if (previous.webSearchEnabled !== current.webSearchEnabled) {
+    return `web search enabled: ${String(previous.webSearchEnabled)} -> ${String(current.webSearchEnabled)}`;
   }
   if (previous.speed !== current.speed) {
     return `speed: ${String(previous.speed)} -> ${String(current.speed)}`;

@@ -14,7 +14,7 @@ const SYSTEM_DYNAMIC_TOKENS = tokenCount(15);
 const EXCHANGE_TOKENS = tokenCount(180);
 const NEW_QUESTION_TOKENS = tokenCount(40);
 const OUTPUT_TOKENS = tokenCount(160);
-const REQUEST_PARAMS: RequestParams = { model: MODEL, thinking: false };
+const REQUEST_PARAMS: RequestParams = { model: MODEL, thinking: { type: "disabled" } };
 const SEARCH_TOOL = {
   name: "search_web",
   description: "Search the web for current information relevant to the user's question.",
