@@ -9,6 +9,7 @@ import {
 } from "../serialize/canonical-request.js";
 import { sliceByBytes } from "../serialize/segment-map.js";
 import { diagnoseCall, unparseableRequestWarnings } from "./engine.js";
+import { diagnosisWarnings, findAllDiagnoses } from "./run.js";
 
 const GAP_MS = 5000;
 function makeUsage(overrides: Partial<Usage> = {}): Usage {
@@ -1074,5 +1075,58 @@ describe("min-cacheable threshold: per-model minimum from the pricing table", ()
     expect(result.kind).toBe("diagnosis");
     if (result.kind !== "diagnosis") throw new Error("expected a diagnosis");
     expect(result.diagnosis.cause).toBe("prefix-too-short");
+  });
+});
+describe("a trace containing an unparseable request", () => {
+  it("does not throw, reports the bad call as unparseable, and still diagnoses the other calls", () => {
+    const system = (iso: string) => [{ type: "text", text: `Current time: ${iso}` }];
+    const first = makeCall({
+      wireBody: { tools: [], system: system("2026-07-24T10:00:00Z"), messages: [] },
+      timestamp: 0,
+      usage: { cacheCreationInputTokens: tokenCount(300) }
+    });
+    const broken: LlmCall = {
+      ...makeCall({ wireBody: {}, timestamp: 1000 }),
+      payload: { wireBody: "{not json" }
+    };
+    const third = makeCall({
+      wireBody: { tools: [], system: system("2026-11-01T03:30:00Z"), messages: [] },
+      timestamp: 2000,
+      usage: { cacheCreationInputTokens: tokenCount(300) }
+    });
+    const calls = [first, broken, third];
+    expect(diagnoseCall(first, broken)).toEqual({ kind: "unparseable-request" });
+    const findings = findAllDiagnoses(calls);
+    expect(findings.map((f) => f.call.id)).toEqual([third.id]);
+    expect(findings[0]?.diagnosis.cause).toBe("dynamic-prefix-content");
+    expect(unparseableRequestWarnings(calls)).toHaveLength(1);
+  });
+});
+describe("diagnosisWarnings", () => {
+  it("names a miss on a long enough stable prefix that no rule could classify, and an unparseable call", () => {
+    const wireBody = {
+      tools: [],
+      system: [{ type: "text", text: "S".repeat(4200), cache_control: { type: "ephemeral" } }],
+      messages: []
+    };
+    const first = makeCall({
+      wireBody,
+      timestamp: 0,
+      usage: { cacheCreationInputTokens: tokenCount(1050) }
+    });
+    const second = makeCall({ wireBody, timestamp: GAP_MS });
+    const broken: LlmCall = {
+      ...makeCall({ wireBody: {}, timestamp: 2 * GAP_MS }),
+      payload: { wireBody: "{not json" }
+    };
+    const warnings = diagnosisWarnings([first, second, broken]);
+    expect(warnings).toHaveLength(2);
+    expect(warnings).toContainEqual(expect.stringContaining(`"${broken.id}"`));
+    expect(warnings).toContainEqual(
+      expect.stringContaining(
+        `call "${second.id}" (step "step"): cache miss with a stable prefix could not be classified`
+      )
+    );
+    expect(findAllDiagnoses([first, second, broken])).toEqual([]);
   });
 });
