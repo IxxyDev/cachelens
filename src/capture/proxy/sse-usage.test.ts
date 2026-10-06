@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { createOpenAiSseUsageAccumulator } from "../usage/openai.js";
 import { createSseUsageAccumulator } from "./sse-usage.js";
+
 function sseEvent(type: string, data: unknown): string {
   return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -53,6 +55,20 @@ describe("createSseUsageAccumulator", () => {
       cacheReadInputTokens: 0
     });
   });
+  it("decodes a multi-byte UTF-8 character split across Buffer chunks", () => {
+    const acc = createSseUsageAccumulator();
+    const bytes = Buffer.from(
+      sseEvent("message_start", {
+        type: "message_start",
+        message: { content: "éé", usage: { input_tokens: 11 } }
+      }),
+      "utf8"
+    );
+    const splitAt = bytes.indexOf(0xc3) + 1;
+    acc.push(bytes.subarray(0, splitAt));
+    acc.push(bytes.subarray(splitAt));
+    expect(acc.finalize().inputTokens).toBe(11);
+  });
   it("flushes an unterminated trailing line at finalize", () => {
     const acc = createSseUsageAccumulator();
     const full = sseEvent("message_start", {
@@ -83,5 +99,69 @@ describe("createSseUsageAccumulator", () => {
     acc.push("data: \n");
     acc.push(": comment\n\n");
     expect(() => acc.finalize()).not.toThrow();
+  });
+  it("drops an unterminated line longer than the limit with one warning, then keeps parsing", () => {
+    const warnings: string[] = [];
+    const acc = createSseUsageAccumulator({
+      maxLineLength: 1024,
+      onWarning: (m) => warnings.push(m)
+    });
+    acc.push("data: ");
+    for (let i = 0; i < 10; i++) acc.push("x".repeat(512));
+    acc.push("tail-of-the-huge-line\n\n");
+    acc.push(
+      sseEvent("message_start", {
+        type: "message_start",
+        message: { usage: { input_tokens: 9, output_tokens: 0 } }
+      })
+    );
+    expect(acc.finalize().inputTokens).toBe(9);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("1024");
+  });
+  it("drops a complete line longer than the limit delivered in a single chunk", () => {
+    const warnings: string[] = [];
+    const acc = createSseUsageAccumulator({
+      maxLineLength: 64,
+      onWarning: (m) => warnings.push(m)
+    });
+    acc.push(
+      sseEvent("message_start", {
+        type: "message_start",
+        message: { usage: { input_tokens: 9, output_tokens: 0 }, pad: "p".repeat(100) }
+      })
+    );
+    expect(acc.finalize().inputTokens).toBe(0);
+    expect(warnings).toHaveLength(1);
+  });
+  it("defaults the line limit to 1 MiB", () => {
+    const warnings: string[] = [];
+    const acc = createSseUsageAccumulator({ onWarning: (m) => warnings.push(m) });
+    acc.push(`data: ${"x".repeat(1024 * 1024 + 1)}`);
+    expect(warnings).toHaveLength(1);
+    acc.finalize();
+  });
+  it("decodes a multi-byte character split across chunks in the OpenAI accumulator", () => {
+    const acc = createOpenAiSseUsageAccumulator();
+    const bytes = Buffer.from(
+      `data: ${JSON.stringify({
+        choices: [{ delta: { content: "日本" } }],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 2,
+          prompt_tokens_details: { cached_tokens: 4 }
+        }
+      })}\n\n`,
+      "utf8"
+    );
+    const splitAt = bytes.indexOf(0xe6) + 1;
+    acc.push(bytes.subarray(0, splitAt));
+    acc.push(bytes.subarray(splitAt));
+    expect(acc.finalize()).toEqual({
+      inputTokens: 6,
+      outputTokens: 2,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 4
+    });
   });
 });

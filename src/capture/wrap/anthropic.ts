@@ -1,137 +1,35 @@
-import { randomUUID } from "node:crypto";
 import { normalizeSortedKeys } from "../../core/diff/normalize.js";
-import type {
-  LlmCall,
-  RequestParams,
-  ThinkingParams,
-  ThinkingType,
-  Usage
-} from "../../core/model/call.js";
-import { tokenCount } from "../../core/model/types.js";
-import type { TraceStore } from "../../store/trace-store.js";
-import { redactWireBody } from "../redact.js";
-export type FetchLike = (
-  input: string | URL,
-  init?: {
-    readonly method?: string;
-    readonly headers?: unknown;
-    readonly body?: unknown;
-    readonly signal?: unknown;
-  }
-) => Promise<FetchResponseLike>;
-export interface FetchResponseLike {
-  readonly ok: boolean;
-  readonly status: number;
-  clone(): FetchResponseLike;
-  json(): Promise<unknown>;
-}
-export interface CaptureContext {
-  readonly sessionId: string;
-  readonly stepName: string;
-  readonly parentCallId?: string;
-}
-export interface WrapAnthropicOptions extends CaptureContext {
-  readonly store: TraceStore;
-  readonly raw?: boolean;
-  readonly fetch?: FetchLike;
-  readonly now?: () => number;
-  readonly onCaptureError?: (error: unknown) => void;
-}
-export function createCaptureFetch(options: WrapAnthropicOptions): FetchLike {
-  const underlyingFetch = options.fetch ?? (globalThis.fetch as unknown as FetchLike);
-  const now = options.now ?? Date.now;
-  const onCaptureError = options.onCaptureError ?? defaultCaptureErrorHandler;
-  return async (input, init) => {
-    const startedAt = now();
-    const response = await underlyingFetch(input, init);
-    const durationMs = now() - startedAt;
-    if (response.ok) {
-      try {
-        await recordCall(options, init?.body, response.clone(), startedAt, durationMs);
-      } catch (error) {
-        onCaptureError(error);
-      }
-    }
-    return response;
-  };
-}
-function defaultCaptureErrorHandler(error: unknown): void {
-  console.error("[cachelens capture] append failed:", error);
-}
-async function recordCall(
-  options: WrapAnthropicOptions,
-  requestBody: unknown,
-  response: FetchResponseLike,
-  startedAt: number,
-  durationMs: number
-): Promise<void> {
-  const wireBody = typeof requestBody === "string" ? requestBody : "";
-  const usage = await extractUsage(response);
-  const call: LlmCall = {
-    id: randomUUID(),
-    sessionId: options.sessionId,
-    stepName: options.stepName,
-    ...(options.parentCallId !== undefined ? { parentCallId: options.parentCallId } : {}),
-    timestamp: startedAt,
+import type { RequestParams, ThinkingParams, ThinkingType } from "../../core/model/call.js";
+import {
+  type CaptureAdapter,
+  type CaptureFetch,
+  type CaptureOptions,
+  createCaptureFetch
+} from "../capture-fetch.js";
+import { type FetchLike, isObject, parseJsonText, requestsStream } from "../shared.js";
+import {
+  anthropicUsageFromBody,
+  createAnthropicSseUsageAccumulator,
+  parseAnthropicUsageFromJsonText
+} from "../usage/anthropic.js";
+
+export type { CaptureFetch } from "../capture-fetch.js";
+export type { CaptureContext, FetchLike, FetchResponseLike } from "../shared.js";
+export { ZERO_USAGE } from "../shared.js";
+export interface WrapAnthropicOptions extends CaptureOptions {}
+export const anthropicCaptureAdapter: CaptureAdapter = {
+  provider: "anthropic",
+  parseRequest: (wireBody) => ({
     params: parseRequestParams(wireBody),
-    payload: { wireBody: redactWireBody(wireBody, { raw: options.raw ?? false }) },
-    usage,
-    durationMs
-  };
-  await options.store.append(call);
-}
-export const ZERO_USAGE: Usage = {
-  inputTokens: tokenCount(0),
-  outputTokens: tokenCount(0),
-  cacheCreationInputTokens: tokenCount(0),
-  cacheReadInputTokens: tokenCount(0)
+    stream: requestsStream(wireBody)
+  }),
+  parseUsageJson: anthropicUsageFromBody,
+  createSseUsageAccumulator: createAnthropicSseUsageAccumulator
 };
-interface RawUsage {
-  readonly input_tokens?: unknown;
-  readonly output_tokens?: unknown;
-  readonly cache_creation_input_tokens?: unknown;
-  readonly cache_read_input_tokens?: unknown;
+export function createAnthropicCaptureFetch(options: WrapAnthropicOptions): CaptureFetch {
+  return createCaptureFetch(anthropicCaptureAdapter, options);
 }
-interface RawResponseBody {
-  readonly usage?: unknown;
-}
-function usageFromParsedBody(body: unknown): Usage {
-  if (body === null || typeof body !== "object") {
-    return ZERO_USAGE;
-  }
-  const usage = (body as RawResponseBody).usage;
-  if (usage === null || typeof usage !== "object") {
-    return ZERO_USAGE;
-  }
-  const u = usage as RawUsage;
-  return {
-    inputTokens: tokenCount(readNumber(u.input_tokens)),
-    outputTokens: tokenCount(readNumber(u.output_tokens)),
-    cacheCreationInputTokens: tokenCount(readNumber(u.cache_creation_input_tokens)),
-    cacheReadInputTokens: tokenCount(readNumber(u.cache_read_input_tokens))
-  };
-}
-export function parseUsageFromJsonText(text: string): Usage {
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return ZERO_USAGE;
-  }
-  return usageFromParsedBody(body);
-}
-async function extractUsage(response: FetchResponseLike): Promise<Usage> {
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    return ZERO_USAGE;
-  }
-  return usageFromParsedBody(body);
-}
-function readNumber(value: unknown): number {
-  return typeof value === "number" ? value : 0;
-}
+export const parseUsageFromJsonText = parseAnthropicUsageFromJsonText;
 interface RawRequestBody {
   readonly model?: unknown;
   readonly tool_choice?: unknown;
@@ -145,13 +43,8 @@ interface RawRequestBody {
   readonly system?: unknown;
 }
 export function parseRequestParams(wireBody: string): RequestParams {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(wireBody);
-  } catch {
-    return { model: "unknown" };
-  }
-  if (parsed === null || typeof parsed !== "object") {
+  const parsed = parseJsonText(wireBody);
+  if (!isObject(parsed)) {
     return { model: "unknown" };
   }
   const body = parsed as RawRequestBody;
@@ -265,5 +158,5 @@ export function wrapAnthropic<TClient>(
   createClient: (fetch: FetchLike) => TClient,
   options: WrapAnthropicOptions
 ): TClient {
-  return createClient(createCaptureFetch(options));
+  return createClient(createAnthropicCaptureFetch(options));
 }

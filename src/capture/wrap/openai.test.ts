@@ -8,6 +8,7 @@ import {
   usageFromOpenAiBody,
   wrapOpenAi
 } from "./openai.js";
+
 function jsonResponse(body: unknown, ok = true): FetchResponseLike {
   const payload = JSON.stringify(body);
   const response: FetchResponseLike = {
@@ -71,6 +72,7 @@ describe("createOpenAiCaptureFetch", () => {
       fetch: underlying
     });
     await fetch("https://api.openai.com/v1/chat/completions", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.usage).toEqual({
       inputTokens: 200,
@@ -89,6 +91,7 @@ describe("createOpenAiCaptureFetch", () => {
       fetch: underlying
     });
     await fetch("https://api.openai.com/v1/chat/completions", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.provider).toBe("openai");
   });
@@ -108,6 +111,7 @@ describe("createOpenAiCaptureFetch", () => {
       }
     });
     await fetch("https://api.openai.com/v1/chat/completions", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.sessionId).toBe("session-42");
     expect(call?.stepName).toBe("planner");
@@ -125,6 +129,7 @@ describe("createOpenAiCaptureFetch", () => {
       fetch: underlying
     });
     await fetch("https://api.openai.com/v1/chat/completions", { body: requestBody() });
+    await fetch.flush();
     await expect(store.list()).resolves.toEqual([]);
   });
   it("propagates underlying fetch errors without capturing", async () => {
@@ -141,6 +146,7 @@ describe("createOpenAiCaptureFetch", () => {
     await expect(
       fetch("https://api.openai.com/v1/chat/completions", { body: requestBody() })
     ).rejects.toThrow("network down");
+    await fetch.flush();
     await expect(store.list()).resolves.toEqual([]);
   });
   it("never breaks the real response when store.append fails; reports via onCaptureError", async () => {
@@ -163,6 +169,7 @@ describe("createOpenAiCaptureFetch", () => {
       body: requestBody()
     });
     await expect(response.json()).resolves.toEqual(SUCCESS_BODY);
+    await fetch.flush();
     expect(captured).toHaveLength(1);
     expect((captured[0] as Error).message).toBe("disk full");
   });
@@ -200,9 +207,154 @@ describe("usageFromOpenAiBody / parseOpenAiUsageFromJsonText", () => {
     });
   });
 });
+describe("createOpenAiCaptureFetch: redaction", () => {
+  const secretBody = requestBody({
+    messages: [
+      { role: "system", content: "TOP-SECRET-SYSTEM-PROMPT" },
+      { role: "user", content: [{ type: "text", text: "my password is hunter2" }] }
+    ]
+  });
+  it("redacts the stored wire-body by default: placeholders, no secret text", async () => {
+    const store = new MemoryTraceStore();
+    const fetch = createOpenAiCaptureFetch({
+      store,
+      sessionId: "s1",
+      stepName: "step1",
+      fetch: async () => jsonResponse(SUCCESS_BODY)
+    });
+    await fetch("https://api.openai.com/v1/chat/completions", { body: secretBody });
+    await fetch.flush();
+    const [call] = await store.list();
+    const stored = call?.payload.wireBody ?? "";
+    expect(stored).not.toContain("TOP-SECRET-SYSTEM-PROMPT");
+    expect(stored).not.toContain("hunter2");
+    expect(stored).toMatch(/\[R:[0-9a-f]{8}:\d+\]/);
+    expect(JSON.parse(stored).model).toBe("gpt-4o");
+  });
+  it("redacts Responses API instructions/input by default", async () => {
+    const store = new MemoryTraceStore();
+    const fetch = createOpenAiCaptureFetch({
+      store,
+      sessionId: "s1",
+      stepName: "step1",
+      fetch: async () => jsonResponse(SUCCESS_BODY)
+    });
+    await fetch("https://api.openai.com/v1/responses", {
+      body: JSON.stringify({
+        model: "gpt-5",
+        instructions: "SECRET-INSTRUCTIONS",
+        input: [{ role: "user", content: [{ type: "input_text", text: "SECRET-INPUT" }] }]
+      })
+    });
+    await fetch.flush();
+    const [call] = await store.list();
+    expect(call?.payload.wireBody).not.toContain("SECRET-INSTRUCTIONS");
+    expect(call?.payload.wireBody).not.toContain("SECRET-INPUT");
+  });
+  it("stores the raw wire-body when raw: true", async () => {
+    const store = new MemoryTraceStore();
+    const fetch = createOpenAiCaptureFetch({
+      store,
+      sessionId: "s1",
+      stepName: "step1",
+      fetch: async () => jsonResponse(SUCCESS_BODY),
+      raw: true
+    });
+    await fetch("https://api.openai.com/v1/chat/completions", { body: secretBody });
+    await fetch.flush();
+    const [call] = await store.list();
+    expect(call?.payload.wireBody).toBe(secretBody);
+  });
+});
+describe("usageFromOpenAiBody: Responses API", () => {
+  it("maps input_tokens / input_tokens_details.cached_tokens, excluding cached from input", () => {
+    expect(
+      usageFromOpenAiBody({
+        object: "response",
+        usage: {
+          input_tokens: 900,
+          output_tokens: 12,
+          input_tokens_details: { cached_tokens: 600 }
+        }
+      })
+    ).toEqual({
+      inputTokens: 300,
+      outputTokens: 12,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 600
+    });
+  });
+});
 describe("parseOpenAiRequestParams", () => {
   it("extracts the model", () => {
     expect(parseOpenAiRequestParams(requestBody())).toEqual({ model: "gpt-4o" });
+  });
+  it("parses a Responses API body (input/instructions) like a chat body", () => {
+    expect(
+      parseOpenAiRequestParams(
+        JSON.stringify({
+          model: "gpt-5",
+          instructions: "be brief",
+          input: "hello",
+          tool_choice: { type: "function", name: "lookup" }
+        })
+      )
+    ).toEqual({ model: "gpt-5", toolChoice: "function:lookup" });
+  });
+  it("names the forced function of a Chat Completions tool_choice", () => {
+    expect(
+      parseOpenAiRequestParams(
+        requestBody({ tool_choice: { type: "function", function: { name: "search" } } })
+      )
+    ).toEqual({ model: "gpt-4o", toolChoice: "function:search" });
+  });
+  it("keeps a typed tool_choice without a forced name as just its type", () => {
+    // Responses API built-in tool: no name, so only the type distinguishes it.
+    expect(parseOpenAiRequestParams(requestBody({ tool_choice: { type: "file_search" } }))).toEqual(
+      { model: "gpt-4o", toolChoice: "file_search" }
+    );
+    // A function choice whose `function` is not an object carries no name.
+    expect(
+      parseOpenAiRequestParams(requestBody({ tool_choice: { type: "function", function: "x" } }))
+    ).toEqual({ model: "gpt-4o", toolChoice: "function" });
+    // A non-string name is not a forced name.
+    expect(
+      parseOpenAiRequestParams(
+        requestBody({ tool_choice: { type: "function", function: { name: 42 } } })
+      )
+    ).toEqual({ model: "gpt-4o", toolChoice: "function" });
+  });
+  it("falls back to the JSON of a tool_choice it cannot read", () => {
+    expect(parseOpenAiRequestParams(requestBody({ tool_choice: { name: "lookup" } }))).toEqual({
+      model: "gpt-4o",
+      toolChoice: '{"name":"lookup"}'
+    });
+    expect(parseOpenAiRequestParams(requestBody({ tool_choice: ["auto"] }))).toEqual({
+      model: "gpt-4o",
+      toolChoice: '["auto"]'
+    });
+    expect(parseOpenAiRequestParams(requestBody({ tool_choice: null }))).toEqual({
+      model: "gpt-4o",
+      toolChoice: "null"
+    });
+  });
+  it("distinguishes 'required' from 'auto' and omits a missing tool_choice", () => {
+    const auto = parseOpenAiRequestParams(requestBody({ tool_choice: "auto" }));
+    const required = parseOpenAiRequestParams(requestBody({ tool_choice: "required" }));
+    expect(required).toEqual({ model: "gpt-4o", toolChoice: "required" });
+    expect(auto.toolChoice).not.toBe(required.toolChoice);
+    expect("toolChoice" in parseOpenAiRequestParams(requestBody())).toBe(false);
+  });
+  it("records model 'unknown' when model is not a string", () => {
+    expect(parseOpenAiRequestParams(JSON.stringify({ model: 5, messages: [] }))).toEqual({
+      model: "unknown"
+    });
+  });
+  it("extracts a string tool_choice from a chat body", () => {
+    expect(parseOpenAiRequestParams(requestBody({ tool_choice: "auto" }))).toEqual({
+      model: "gpt-4o",
+      toolChoice: "auto"
+    });
   });
   it("falls back to unknown on a malformed body rather than throwing", () => {
     expect(parseOpenAiRequestParams("not json")).toEqual({ model: "unknown" });

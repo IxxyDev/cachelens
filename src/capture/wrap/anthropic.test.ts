@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import { diffParams } from "../../core/diff/params-diff.js";
 import { MemoryTraceStore } from "../../store/memory-store.js";
 import {
+  createAnthropicCaptureFetch,
   type FetchLike,
   type FetchResponseLike,
-  createCaptureFetch,
   parseRequestParams,
   wrapAnthropic
 } from "./anthropic.js";
+
 function jsonResponse(body: unknown, ok = true): FetchResponseLike {
   const payload = JSON.stringify(body);
   const response: FetchResponseLike = {
@@ -35,7 +36,7 @@ function requestBody(overrides: Record<string, unknown> = {}): string {
     ...overrides
   });
 }
-describe("createCaptureFetch", () => {
+describe("createAnthropicCaptureFetch", () => {
   it("forwards the call unchanged to the underlying fetch", async () => {
     let seenInput: string | URL | undefined;
     let seenInit: unknown;
@@ -45,7 +46,7 @@ describe("createCaptureFetch", () => {
       return jsonResponse(SUCCESS_BODY);
     };
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -65,7 +66,7 @@ describe("createCaptureFetch", () => {
   it("returns the response body intact to the caller", async () => {
     const underlying: FetchLike = async () => jsonResponse(SUCCESS_BODY);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -78,7 +79,7 @@ describe("createCaptureFetch", () => {
     let tick = 1000;
     const underlying: FetchLike = async () => jsonResponse(SUCCESS_BODY);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "session-42",
       stepName: "planner",
@@ -90,6 +91,7 @@ describe("createCaptureFetch", () => {
       }
     });
     await fetch("https://api.anthropic.com/v1/messages", { body: requestBody() });
+    await fetch.flush();
     const calls = await store.list();
     expect(calls).toHaveLength(1);
     const call = calls[0];
@@ -114,7 +116,7 @@ describe("createCaptureFetch", () => {
       return jsonResponse(SUCCESS_BODY);
     };
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -122,6 +124,7 @@ describe("createCaptureFetch", () => {
       now: () => tick
     });
     await fetch("https://api.anthropic.com/v1/messages", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.timestamp).toBe(1000);
     expect(call?.durationMs).toBe(500);
@@ -129,26 +132,28 @@ describe("createCaptureFetch", () => {
   it("omits parentCallId when not provided", async () => {
     const underlying: FetchLike = async () => jsonResponse(SUCCESS_BODY);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
       fetch: underlying
     });
     await fetch("https://api.anthropic.com/v1/messages", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call && "parentCallId" in call).toBe(false);
   });
   it("does not capture on a non-ok response", async () => {
     const underlying: FetchLike = async () => jsonResponse({ error: "boom" }, false);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
       fetch: underlying
     });
     await fetch("https://api.anthropic.com/v1/messages", { body: requestBody() });
+    await fetch.flush();
     await expect(store.list()).resolves.toEqual([]);
   });
   it("propagates underlying fetch errors without capturing", async () => {
@@ -156,7 +161,7 @@ describe("createCaptureFetch", () => {
       throw new Error("network down");
     };
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -165,6 +170,7 @@ describe("createCaptureFetch", () => {
     await expect(
       fetch("https://api.anthropic.com/v1/messages", { body: requestBody() })
     ).rejects.toThrow("network down");
+    await fetch.flush();
     await expect(store.list()).resolves.toEqual([]);
   });
   it("never breaks the real response when store.append fails; reports via onCaptureError", async () => {
@@ -176,7 +182,7 @@ describe("createCaptureFetch", () => {
       list: async () => []
     };
     const captured: unknown[] = [];
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store: failingStore,
       sessionId: "s1",
       stepName: "step1",
@@ -187,6 +193,7 @@ describe("createCaptureFetch", () => {
       body: requestBody()
     });
     await expect(response.json()).resolves.toEqual(SUCCESS_BODY);
+    await fetch.flush();
     expect(captured).toHaveLength(1);
     expect((captured[0] as Error).message).toBe("disk full");
   });
@@ -201,13 +208,14 @@ describe("createCaptureFetch", () => {
     };
     const underlying: FetchLike = async () => brokenResponse;
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
       fetch: underlying
     });
     await fetch("https://api.anthropic.com/v1/messages", { body: requestBody() });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.usage).toEqual({
       inputTokens: 0,
@@ -219,7 +227,7 @@ describe("createCaptureFetch", () => {
   it("redacts the stored wire-body by default", async () => {
     const underlying: FetchLike = async () => jsonResponse(SUCCESS_BODY);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -230,13 +238,14 @@ describe("createCaptureFetch", () => {
         messages: [{ role: "user", content: [{ type: "text", text: "secret" }] }]
       })
     });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.payload.wireBody).not.toContain("secret");
   });
   it("stores the raw wire-body when raw: true", async () => {
     const underlying: FetchLike = async () => jsonResponse(SUCCESS_BODY);
     const store = new MemoryTraceStore();
-    const fetch = createCaptureFetch({
+    const fetch = createAnthropicCaptureFetch({
       store,
       sessionId: "s1",
       stepName: "step1",
@@ -248,6 +257,7 @@ describe("createCaptureFetch", () => {
         messages: [{ role: "user", content: [{ type: "text", text: "secret" }] }]
       })
     });
+    await fetch.flush();
     const [call] = await store.list();
     expect(call?.payload.wireBody).toContain("secret");
   });
