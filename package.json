@@ -40,7 +40,6 @@
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.2",
     "@vitest/coverage-v8": "^2.1.8",
     "typescript": "^5.7.2",
@@ -49,8 +48,5 @@
   "allowScripts": {
     "@biomejs/biome@1.9.4": true,
     "esbuild@0.21.5": true
-  },
-  "dependencies": {
-    "better-sqlite3": "^13.0.1"
   }
 }

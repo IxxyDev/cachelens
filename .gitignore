@@ -7,5 +7,3 @@ coverage/
 # Trace payloads are local-only (may contain redacted-but-sensitive prompt data)
 *.jsonl
 !fixtures/**/*.jsonl
-cachelens.db
-cachelens.db-*
