@@ -49,6 +49,25 @@ jobs:
       - name: Self-check (cachelens gating its own demo trace)
         run: node dist/cli/index.js check fixtures/demo-agent/fixed.jsonl --min-hit-rate 80
 
+      # The naive trace has known cache-miss root causes: diagnose must find them
+      # and exit 1. Exit 0 (nothing found) or 2 (crash/usage error) both fail.
+      - name: Diagnose finds the naive trace's cache misses (expects exit 1)
+        run: |
+          set +e
+          node dist/cli/index.js diagnose fixtures/demo-agent/naive.jsonl
+          status=$?
+          set -e
+          test "$status" -eq 1
+
+      # Interleaved sessions and out-of-order records are healthy traces: any
+      # finding here is a false positive.
+      - name: No false positives on interleaved and out-of-order traces
+        run: |
+          for trace in interleaved out-of-order; do
+            node dist/cli/index.js diagnose "fixtures/demo-agent/$trace.jsonl" --json > "$RUNNER_TEMP/$trace.json"
+            node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (r.findingCount !== 0) { console.error(process.argv[2] + ": expected 0 findings, got " + r.findingCount); process.exit(1); }' "$RUNNER_TEMP/$trace.json" "$trace"
+          done
+
       # `proxy` is wired but not exercised above (it needs a live upstream
       # to say anything meaningful, which belongs in start-proxy's own
       # test suite, not a CI network dependency). This is a cheap sanity

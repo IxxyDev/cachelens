@@ -3,10 +3,12 @@ import { fileURLToPath } from "node:url";
 import type { LlmCall, RequestParams } from "../core/model/call.js";
 import { tokenCount } from "../core/model/types.js";
 import { writeJsonlFile } from "../store/jsonl.js";
-const MODEL = "claude-sonnet-4-5";
+
+const MODEL = "claude-sonnet-5-5";
 const SESSION_COUNT = 3;
 const TURNS_PER_SESSION = 6;
 const TURN_INTERVAL_MS = 60000;
+const DAY_MS = 86400000;
 const BASE_TIMESTAMP_MS = Date.parse("2026-07-24T10:00:00Z");
 const TOOLS_TOKENS = tokenCount(750);
 const SYSTEM_STATIC_TOKENS = tokenCount(350);
@@ -69,11 +71,7 @@ function messagesForTurn(turn: number): MessageBlock[] {
   const priorExchanges = Array.from({ length: turn - 1 }, (_, i) => resolvedExchange(i + 1)).flat();
   return [...priorExchanges, { role: "user", content: [{ type: "text", text: question(turn) }] }];
 }
-function systemBlocks(
-  variant: "naive" | "fixed",
-  turn: number,
-  timestampIso: string
-): Record<string, unknown>[] {
+function systemBlocks(variant: "naive" | "fixed", timestampIso: string): Record<string, unknown>[] {
   const text =
     variant === "naive"
       ? `${SYSTEM_INSTRUCTIONS} Current time: ${timestampIso}.`
@@ -86,7 +84,7 @@ function wireBody(variant: "naive" | "fixed", turn: number, timestampIso: string
     max_tokens: 1024,
     thinking: { type: "disabled" },
     tools: [SEARCH_TOOL],
-    system: systemBlocks(variant, turn, timestampIso),
+    system: systemBlocks(variant, timestampIso),
     messages: messagesForTurn(turn)
   });
 }
@@ -94,7 +92,10 @@ function buildSessionCalls(variant: "naive" | "fixed", sessionIndex: number): Ll
   const sessionId = `session-${String(sessionIndex).padStart(2, "0")}`;
   const calls: LlmCall[] = [];
   for (let turn = 1; turn <= TURNS_PER_SESSION; turn++) {
-    const timestampIso = new Date(BASE_TIMESTAMP_MS + (turn - 1) * TURN_INTERVAL_MS).toISOString();
+    // Each session runs on its own day; the system prompt's "Current time" matches the record timestamp.
+    const timestamp =
+      BASE_TIMESTAMP_MS + (sessionIndex - 1) * DAY_MS + (turn - 1) * TURN_INTERVAL_MS;
+    const timestampIso = new Date(timestamp).toISOString();
     const isFirstTurn = turn === 1;
     const cacheReadInputTokens = isFirstTurn
       ? 0
@@ -116,7 +117,7 @@ function buildSessionCalls(variant: "naive" | "fixed", sessionIndex: number): Ll
       id: `${sessionId}-turn-${turn}`,
       sessionId,
       stepName: "react-loop",
-      timestamp: BASE_TIMESTAMP_MS + (sessionIndex - 1) * 86400000 + (turn - 1) * TURN_INTERVAL_MS,
+      timestamp,
       params: REQUEST_PARAMS,
       payload: { wireBody: wireBody(variant, turn, timestampIso) },
       usage: {
