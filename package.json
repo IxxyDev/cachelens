@@ -1,7 +1,7 @@
 {
   "name": "cachelens",
-  "version": "1.0.0",
-  "description": "Internal token-economics profiler for LLM agent pipelines: cost distribution, cache hit rate, and byte-level prompt-cache-miss root-cause diagnostics, run as a CI gate.",
+  "version": "2.0.0",
+  "description": "Token-economics profiler for LLM agent pipelines: cost distribution, cache hit rate, and byte-level prompt-cache-miss root-cause diagnostics, run as a CI gate.",
   "keywords": [
     "llm",
     "prompt-caching",
@@ -11,9 +11,11 @@
     "anthropic"
   ],
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "bin": {
     "cachelens": "./dist/cli/index.js"
@@ -38,7 +40,9 @@
   },
   "files": [
     "dist",
+    "!dist/scripts",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
