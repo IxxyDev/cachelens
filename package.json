@@ -19,7 +19,10 @@
     "cachelens": "./dist/cli/index.js"
   },
   "exports": {
-    ".": "./dist/cli/index.js",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./capture/wrap/anthropic": {
       "types": "./dist/capture/wrap/anthropic.d.ts",
       "default": "./dist/capture/wrap/anthropic.js"
