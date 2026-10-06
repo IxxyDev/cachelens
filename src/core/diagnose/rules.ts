@@ -5,38 +5,108 @@ import type { CacheBreakpoint, CacheTtl } from "../model/breakpoint.js";
 import type { LlmCall, RequestParams, Usage } from "../model/call.js";
 import type { Provider } from "../model/provider.js";
 import { CACHE_TIER_ORDER, type CacheTier } from "../model/tier.js";
-import { type ByteOffset, type TokenCount, type Usd, byteOffset } from "../model/types.js";
-import { computeTieredCounterfactual, computeWastedUsd } from "../pricing/cost.js";
+import {
+  type ByteOffset,
+  byteOffset,
+  type TokenCount,
+  tokenCount,
+  type Usd
+} from "../model/types.js";
+import {
+  effectiveWriteMultiplier,
+  splitWastedUsdByTier,
+  wastedUsdAtMultiplier
+} from "../pricing/cost.js";
 import type { ModelPricing } from "../pricing/table.js";
 import { buildCanonicalRequest } from "../serialize/canonical-request.js";
 import {
-  type Segment,
   byteLengthUtf8,
+  type Segment,
   sliceByBytes,
   structuralPathAt,
   tierAt,
   tierSegment
 } from "../serialize/segment-map.js";
 import { excerptAroundByteOffset } from "./recommend.js";
-import type { Diagnosis } from "./taxonomy.js";
+import type { PricedDiagnosis } from "./taxonomy.js";
+
 const SINGLE_TIER_PLACEHOLDER_BYTES: Readonly<Record<CacheTier, number>> = {
   tools: 1,
   system: 1,
   messages: 1
 };
-function singleTierWastedUsdByTier(
-  tier: CacheTier,
-  wastedTokens: TokenCount,
+/**
+ * What pricing a miss needs beyond the current call's usage. `classifyMiss` builds it once per
+ * call; every field is optional so a rule can be exercised on its own.
+ */
+export interface WasteBasis {
+  /** The partner call's usage: its read + created tokens are all that a hit could have reused. */
+  readonly previousUsage?: Usage;
+  /** TTL the current call's writes are billed at when its usage carries no 5m/1h split. */
+  readonly writeTtl?: CacheTtl;
+  readonly provider?: Provider;
+  /** Canonical bytes shared with the partner (the stable zone), for the OpenAI estimate. */
+  readonly stableBytes?: number;
+  /** Total canonical bytes of the current request, for the OpenAI estimate. */
+  readonly totalBytes?: number;
+}
+interface Waste {
+  readonly wastedTokens: TokenCount;
+  readonly wastedUsd: Usd;
+  readonly wastedEstimate?: true;
+}
+/**
+ * Anthropic: the tokens written this call that a hit could have read instead, capped at what the
+ * partner held (its read + created tokens), so newly appended content is never counted, priced
+ * at the blended 5m/1h write multiplier minus the read multiplier.
+ * OpenAI reports no cache writes, so the stable zone's share of the prompt tokens is estimated
+ * (stableBytes / totalBytes) minus what was actually read, priced at 1x minus the read multiplier.
+ */
+export function computeWaste(
+  currentUsage: Usage,
   pricing: ModelPricing,
-  ttl: CacheTtl
-): ReadonlyMap<CacheTier, Usd> {
-  return computeTieredCounterfactual({
-    invalidatedTiers: [tier],
-    tierByteLengths: SINGLE_TIER_PLACEHOLDER_BYTES,
-    cacheCreationInputTokens: wastedTokens,
-    pricing,
-    ttl
-  }).wastedUsdByTier;
+  basis: WasteBasis = {}
+): Waste {
+  if (basis.provider === "openai") {
+    const { stableBytes, totalBytes } = basis;
+    if (stableBytes !== undefined && totalBytes !== undefined && totalBytes > 0) {
+      const promptTokens =
+        currentUsage.inputTokens +
+        currentUsage.cacheReadInputTokens +
+        currentUsage.cacheCreationInputTokens;
+      const stableTokens = Math.round(
+        (Math.min(stableBytes, totalBytes) / totalBytes) * promptTokens
+      );
+      const missedTokens = Math.max(0, stableTokens - currentUsage.cacheReadInputTokens);
+      return {
+        wastedTokens: tokenCount(missedTokens),
+        wastedUsd: wastedUsdAtMultiplier(missedTokens, pricing, 1),
+        wastedEstimate: true
+      };
+    }
+  }
+  const reusable = basis.previousUsage
+    ? basis.previousUsage.cacheReadInputTokens + basis.previousUsage.cacheCreationInputTokens
+    : Number.POSITIVE_INFINITY;
+  const wastedTokens = Math.min(currentUsage.cacheCreationInputTokens, reusable);
+  const writeMultiplier = effectiveWriteMultiplier(currentUsage, pricing, basis.writeTtl ?? "5m");
+  return {
+    wastedTokens: tokenCount(wastedTokens),
+    wastedUsd: wastedUsdAtMultiplier(wastedTokens, pricing, writeMultiplier)
+  };
+}
+/** The Diagnosis waste fields for a miss invalidating `invalidatedTiers`. */
+function wasteFields(
+  waste: Waste,
+  invalidatedTiers: readonly CacheTier[],
+  tierByteLengths: Readonly<Record<CacheTier, number>> = SINGLE_TIER_PLACEHOLDER_BYTES
+): Pick<PricedDiagnosis, "wastedTokens" | "wastedUsd" | "wastedUsdByTier" | "wastedEstimate"> {
+  return {
+    wastedTokens: waste.wastedTokens,
+    wastedUsd: waste.wastedUsd,
+    wastedUsdByTier: splitWastedUsdByTier(invalidatedTiers, tierByteLengths, waste.wastedUsd),
+    ...(waste.wastedEstimate ? { wastedEstimate: true } : {})
+  };
 }
 function tierByteLength(segments: readonly Segment[], tier: CacheTier): number {
   const segment = tierSegment(segments, tier);
@@ -66,8 +136,9 @@ function tierByteLengthsForToolsDrift(
 export function checkRequestParamInvalidation(
   previous: LlmCall,
   current: LlmCall,
-  pricing: ModelPricing
-): Diagnosis | null {
+  pricing: ModelPricing,
+  waste: WasteBasis = {}
+): PricedDiagnosis | null {
   const scope = diffParams(previous.params, current.params);
   if (scope === "none") {
     return null;
@@ -85,15 +156,11 @@ export function checkRequestParamInvalidation(
     byteOffset: byteOffset(0),
     structuralPath: "params",
     excerpt: describeParamChange(previous.params, current.params),
-    wastedTokens: current.usage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(current.usage.cacheCreationInputTokens, pricing, "5m"),
-    wastedUsdByTier: computeTieredCounterfactual({
+    ...wasteFields(
+      computeWaste(current.usage, pricing, { previousUsage: previous.usage, ...waste }),
       invalidatedTiers,
-      tierByteLengths,
-      cacheCreationInputTokens: current.usage.cacheCreationInputTokens,
-      pricing,
-      ttl: "5m"
-    }).wastedUsdByTier,
+      tierByteLengths
+    ),
     recommendation: PARAM_SCOPE_RECOMMENDATION[scope]
   };
 }
@@ -158,7 +225,8 @@ export function checkNondeterministicSerialization(params: {
   readonly canonicalCurrentText: string;
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if (!normalizedJsonEquals(params.previousTierText, params.currentTierText)) {
     return null;
   }
@@ -168,14 +236,7 @@ export function checkNondeterministicSerialization(params: {
     byteOffset: params.divergenceByteOffset,
     structuralPath: params.structuralPath,
     excerpt: excerptAroundByteOffset(params.canonicalCurrentText, params.divergenceByteOffset),
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: singleTierWastedUsdByTier(
-      params.tier,
-      params.currentUsage.cacheCreationInputTokens,
-      params.pricing,
-      "5m"
-    ),
+    ...wasteFields(computeWaste(params.currentUsage, params.pricing, params.waste), [params.tier]),
     recommendation: `Canonicalize serialization of the ${params.tier} tier (e.g. sort object keys before sending) — the content is identical here, only key order differs.`
   };
 }
@@ -186,14 +247,17 @@ export function checkTtlExpiry(params: {
   readonly prefixDiff: PrefixDiffResult;
   readonly pricing: ModelPricing;
   readonly provider?: Provider;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if ((params.provider ?? "anthropic") !== "anthropic") {
     return null;
   }
   if (params.current.usage.cacheCreationInputTokens <= 0) {
     return null;
   }
-  if (!params.prefixDiff.identical) {
+  // An agent loop appends a turn every call, so an expired entry shows up as "previous is a
+  // prefix of current", not only as a byte-identical request.
+  if (!params.prefixDiff.previousIsPrefixOfCurrent) {
     return null;
   }
   if (diffParams(params.previous.params, params.current.params) !== "none") {
@@ -212,17 +276,18 @@ export function checkTtlExpiry(params: {
     invalidatedTiers,
     byteOffset: byteOffset(0),
     structuralPath: "prefix",
-    excerpt: `prefix byte-identical to the previous call, but idle for ${gapMs}ms — past its ${ttl} TTL`,
-    wastedTokens: params.current.usage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.current.usage.cacheCreationInputTokens, params.pricing, ttl),
-    wastedUsdByTier: computeTieredCounterfactual({
+    excerpt: `prefix ${params.prefixDiff.identical ? "byte-identical to" : "extends"} the previous call, but idle for ${gapMs}ms — past its ${ttl} TTL`,
+    ...wasteFields(
+      // The expired entry was written at the previous call's TTL, which overrides the basis.
+      computeWaste(params.current.usage, params.pricing, {
+        previousUsage: params.previous.usage,
+        ...params.waste,
+        writeTtl: ttl
+      }),
       invalidatedTiers,
-      tierByteLengths,
-      cacheCreationInputTokens: params.current.usage.cacheCreationInputTokens,
-      pricing: params.pricing,
-      ttl
-    }).wastedUsdByTier,
-    recommendation: `Set cache_control ttl to "1h" (currently ${ttl}), or call this step more often than every ${ttl} — the prefix was unchanged but idle for ${gapMs}ms.`
+      tierByteLengths
+    ),
+    recommendation: `Set cache_control ttl to "1h" (currently ${ttl}), or call this step more often than every ${ttl} — the previous prefix was unchanged but idle for ${gapMs}ms.`
   };
 }
 function lastDeclaredTtl(breakpoints: readonly CacheBreakpoint[]): CacheTtl | undefined {
@@ -242,7 +307,8 @@ export function checkToolsTierDrift(params: {
   readonly canonicalCurrentText: string;
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if (params.tier !== "tools") {
     return null;
   }
@@ -260,15 +326,11 @@ export function checkToolsTierDrift(params: {
     byteOffset: params.divergenceByteOffset,
     structuralPath: "tools",
     excerpt: excerptAroundByteOffset(params.canonicalCurrentText, params.divergenceByteOffset),
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: computeTieredCounterfactual({
+    ...wasteFields(
+      computeWaste(params.currentUsage, params.pricing, params.waste),
       invalidatedTiers,
-      tierByteLengths,
-      cacheCreationInputTokens: params.currentUsage.cacheCreationInputTokens,
-      pricing: params.pricing,
-      ttl: "5m"
-    }).wastedUsdByTier,
+      tierByteLengths
+    ),
     recommendation:
       "Keep the tool set (names, order, schemas) stable for this step, and place any cache breakpoint after `tools` — a tool-definition change invalidates the entire prefix (tools+system+messages)."
   };
@@ -281,7 +343,8 @@ export function checkContentBlockChurn(params: {
   readonly canonicalCurrentText: string;
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if (!/\.content\[\d+\]$/.test(params.structuralPath)) {
     return null;
   }
@@ -301,14 +364,7 @@ export function checkContentBlockChurn(params: {
     byteOffset: params.divergenceByteOffset,
     structuralPath: params.structuralPath,
     excerpt: excerptAroundByteOffset(params.canonicalCurrentText, params.divergenceByteOffset),
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: singleTierWastedUsdByTier(
-      params.tier,
-      params.currentUsage.cacheCreationInputTokens,
-      params.pricing,
-      "5m"
-    ),
+    ...wasteFields(computeWaste(params.currentUsage, params.pricing, params.waste), [params.tier]),
     recommendation: `Move the "${blockType}" block at ${params.structuralPath} after the cache breakpoint, or keep it byte-stable across calls — non-text content blocks changing before the breakpoint invalidate everything after them.`
   };
 }
@@ -338,7 +394,8 @@ export function checkLookbackWindowExceeded(params: {
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
   readonly provider?: Provider;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if ((params.provider ?? "anthropic") !== "anthropic") {
     return null;
   }
@@ -367,17 +424,42 @@ export function checkLookbackWindowExceeded(params: {
     byteOffset: byteOffset(breakpointOffset),
     structuralPath,
     excerpt: `${blockCount} content blocks between the last stable cache point and the declared breakpoint (limit ${LOOKBACK_WINDOW_LIMIT})`,
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: singleTierWastedUsdByTier(
-      tier,
-      params.currentUsage.cacheCreationInputTokens,
-      params.pricing,
-      "5m"
-    ),
+    ...wasteFields(computeWaste(params.currentUsage, params.pricing, params.waste), [tier]),
     recommendation: `Reduce the number of content blocks before the breakpoint (currently ${blockCount}, vendor lookback window is ${LOOKBACK_WINDOW_LIMIT}) — consolidate blocks, or move the breakpoint earlier.`
   };
 }
+/**
+ * An early breakpoint writes nothing (creation == 0): the stable blocks after it are billed as
+ * plain input instead of cache reads. Their tokens are estimated from their byte share of the
+ * prompt, capped at the uncached input actually billed.
+ */
+function misplacedStableInputWaste(
+  currentUsage: Usage,
+  pricing: ModelPricing,
+  misplacedBytes: number,
+  totalBytes: number
+): Waste {
+  const promptTokens =
+    currentUsage.inputTokens +
+    currentUsage.cacheReadInputTokens +
+    currentUsage.cacheCreationInputTokens;
+  const estimated = totalBytes > 0 ? Math.round((misplacedBytes / totalBytes) * promptTokens) : 0;
+  const tokens = Math.min(estimated, currentUsage.inputTokens);
+  return {
+    wastedTokens: tokenCount(tokens),
+    wastedUsd: wastedUsdAtMultiplier(tokens, pricing, 1),
+    wastedEstimate: true
+  };
+}
+/** Block levels that accept a `cache_control` marker, i.e. where a breakpoint can sit. */
+const BREAKPOINT_BLOCK_PATH = /^(?:tools|system)\[\d+\]$|^messages\[\d+\]\.content\[\d+\]$/;
+/**
+ * The vendor caches the prefix up to a breakpoint, and breakpoints only sit at block ends. A
+ * breakpoint is misplaced when some prefix WAS served from cache (cache_read > 0: the content up
+ * to the breakpoint hit) yet at least one whole block after it was stable too and is re-billed on
+ * every call. With cache_read == 0 the content before the breakpoint also missed, which moving the
+ * breakpoint cannot explain, so this rule does not fire.
+ */
 export function checkBreakpointMisplacement(params: {
   readonly prefixDiff: PrefixDiffResult;
   readonly currentBreakpoints: readonly CacheBreakpoint[];
@@ -387,45 +469,53 @@ export function checkBreakpointMisplacement(params: {
   readonly canonicalCurrentText: string;
   readonly pricing: ModelPricing;
   readonly provider?: Provider;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if ((params.provider ?? "anthropic") !== "anthropic") {
     return null;
   }
   if (params.currentBreakpoints.length === 0) {
     return null;
   }
+  if (params.currentUsage.cacheReadInputTokens <= 0) {
+    return null;
+  }
   const stableBytes = params.prefixDiff.divergenceByteOffset;
   if (stableBytes < params.minCacheableBytesProxy) {
     return null;
   }
-  const { cacheCreationInputTokens, cacheReadInputTokens } = params.currentUsage;
-  const qualifyingSignature =
-    (cacheCreationInputTokens === 0 && cacheReadInputTokens === 0) ||
-    (cacheCreationInputTokens > 0 && cacheReadInputTokens === 0);
-  if (!qualifyingSignature) {
-    return null;
-  }
   const lastBreakpointOffset = Math.max(...params.currentBreakpoints.map((bp) => bp.byteOffset));
-  if (lastBreakpointOffset >= stableBytes) {
+  const stableBlocksAfterBreakpoint = params.currentSegments.filter(
+    (s) =>
+      BREAKPOINT_BLOCK_PATH.test(s.structuralPath) &&
+      s.start >= lastBreakpointOffset &&
+      s.end <= stableBytes
+  );
+  const target = stableBlocksAfterBreakpoint.reduce<Segment | undefined>(
+    (latest, s) => (!latest || s.end > latest.end ? s : latest),
+    undefined
+  );
+  if (!target) {
     return null;
   }
-  const tier = tierAt(params.currentSegments, byteOffset(stableBytes)) ?? "messages";
-  const structuralPath = structuralPathAt(params.currentSegments, byteOffset(stableBytes)) ?? tier;
+  const suggestedOffset = target.end;
+  const waste =
+    params.currentUsage.cacheCreationInputTokens === 0
+      ? misplacedStableInputWaste(
+          params.currentUsage,
+          params.pricing,
+          suggestedOffset - lastBreakpointOffset,
+          params.waste?.totalBytes ?? byteLengthUtf8(params.canonicalCurrentText)
+        )
+      : computeWaste(params.currentUsage, params.pricing, params.waste);
   return {
     cause: "breakpoint-misplacement",
-    invalidatedTiers: [tier],
-    byteOffset: byteOffset(stableBytes),
-    structuralPath,
-    excerpt: excerptAroundByteOffset(params.canonicalCurrentText, byteOffset(stableBytes)),
-    wastedTokens: cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: singleTierWastedUsdByTier(
-      tier,
-      cacheCreationInputTokens,
-      params.pricing,
-      "5m"
-    ),
-    recommendation: `Move the cache breakpoint to wire-body offset ${stableBytes} (the end of the stable zone) — it's currently declared earlier, at offset ${lastBreakpointOffset}, leaving stable content outside the cached prefix.`
+    invalidatedTiers: [target.tier],
+    byteOffset: suggestedOffset,
+    structuralPath: target.structuralPath,
+    excerpt: excerptAroundByteOffset(params.canonicalCurrentText, suggestedOffset),
+    ...wasteFields(waste, [target.tier]),
+    recommendation: `Move the cache breakpoint to the end of ${target.structuralPath} (canonical offset ${suggestedOffset}) — the last breakpoint is at offset ${lastBreakpointOffset}, leaving ${stableBlocksAfterBreakpoint.length} stable block${stableBlocksAfterBreakpoint.length === 1 ? "" : "s"} outside the cached prefix.`
   };
 }
 export function checkPrefixTooShort(params: {
@@ -437,7 +527,8 @@ export function checkPrefixTooShort(params: {
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
   readonly provider?: Provider;
-}): Diagnosis | null {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
   if ((params.provider ?? "anthropic") !== "anthropic") {
     return null;
   }
@@ -452,23 +543,64 @@ export function checkPrefixTooShort(params: {
   }
   const stableBytes = params.prefixDiff.divergenceByteOffset;
   const invalidatedTiers = [...CACHE_TIER_ORDER];
-  const tierByteLengths = { tools: 1, system: 1, messages: 1 };
   return {
     cause: "prefix-too-short",
     invalidatedTiers,
     byteOffset: byteOffset(stableBytes),
     structuralPath: "prefix",
     excerpt: excerptAroundByteOffset(params.canonicalCurrentText, byteOffset(stableBytes)),
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: computeTieredCounterfactual({
-      invalidatedTiers,
-      tierByteLengths,
-      cacheCreationInputTokens: params.currentUsage.cacheCreationInputTokens,
-      pricing: params.pricing,
-      ttl: "5m"
-    }).wastedUsdByTier,
+    ...wasteFields(
+      computeWaste(params.currentUsage, params.pricing, params.waste),
+      invalidatedTiers
+    ),
     recommendation: `The stable prefix is ${params.confirmedTokenCount} tokens, below this model's ${params.minCacheableTokens}-token minimum for caching — consolidate more static content above the threshold, or accept that this step won't cache.`
+  };
+}
+/** Rough bytes-per-token ratio for English-like text, used only when no token count is known. */
+const BYTES_PER_TOKEN_ESTIMATE = 4;
+/**
+ * prefix-too-short without a count_tokens result: a breakpoint is declared on an unchanged or
+ * extended prefix, yet the API read and wrote nothing (gate signature-2). When the canonical
+ * bytes up to the last breakpoint are below the min-cacheable byte proxy, the likeliest cause
+ * is that the vendor silently ignored a breakpoint on a too-short prefix. The token figure is a
+ * byte-based estimate and the diagnosis is flagged `wastedEstimate`.
+ */
+export function checkPrefixTooShortByBytes(params: {
+  readonly currentBreakpoints: readonly CacheBreakpoint[];
+  readonly prefixDiff: PrefixDiffResult;
+  readonly minCacheableBytesProxy: number;
+  readonly minCacheableTokens: TokenCount;
+  readonly canonicalCurrentText: string;
+  readonly currentUsage: Usage;
+  readonly pricing: ModelPricing;
+  readonly provider?: Provider;
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis | null {
+  if ((params.provider ?? "anthropic") !== "anthropic") {
+    return null;
+  }
+  if (params.currentBreakpoints.length === 0 || !params.prefixDiff.previousIsPrefixOfCurrent) {
+    return null;
+  }
+  const { cacheReadInputTokens, cacheCreationInputTokens } = params.currentUsage;
+  if (cacheReadInputTokens !== 0 || cacheCreationInputTokens !== 0) {
+    return null;
+  }
+  const cachedBytes = Math.max(...params.currentBreakpoints.map((bp) => bp.byteOffset));
+  if (cachedBytes >= params.minCacheableBytesProxy) {
+    return null;
+  }
+  const estimatedTokens = Math.round(cachedBytes / BYTES_PER_TOKEN_ESTIMATE);
+  const invalidatedTiers = [...CACHE_TIER_ORDER];
+  const waste = computeWaste(params.currentUsage, params.pricing, params.waste);
+  return {
+    cause: "prefix-too-short",
+    invalidatedTiers,
+    byteOffset: byteOffset(cachedBytes),
+    structuralPath: "prefix",
+    excerpt: excerptAroundByteOffset(params.canonicalCurrentText, byteOffset(cachedBytes)),
+    ...wasteFields({ ...waste, wastedEstimate: true }, invalidatedTiers),
+    recommendation: `The prefix up to the last cache breakpoint is ~${estimatedTokens} tokens (estimated from bytes: ${cachedBytes} bytes at ~${BYTES_PER_TOKEN_ESTIMATE} bytes/token), below this model's ${params.minCacheableTokens}-token minimum, and nothing was read or written — the breakpoint was likely ignored. Confirm with count_tokens, then put more static content before the breakpoint, or accept that this step won't cache.`
   };
 }
 export function buildDynamicPrefixContentDiagnosis(params: {
@@ -478,21 +610,15 @@ export function buildDynamicPrefixContentDiagnosis(params: {
   readonly canonicalCurrentText: string;
   readonly currentUsage: Usage;
   readonly pricing: ModelPricing;
-}): Diagnosis {
+  readonly waste?: WasteBasis;
+}): PricedDiagnosis {
   return {
     cause: "dynamic-prefix-content",
     invalidatedTiers: [params.tier],
     byteOffset: params.divergenceByteOffset,
     structuralPath: params.structuralPath,
     excerpt: excerptAroundByteOffset(params.canonicalCurrentText, params.divergenceByteOffset),
-    wastedTokens: params.currentUsage.cacheCreationInputTokens,
-    wastedUsd: computeWastedUsd(params.currentUsage.cacheCreationInputTokens, params.pricing, "5m"),
-    wastedUsdByTier: singleTierWastedUsdByTier(
-      params.tier,
-      params.currentUsage.cacheCreationInputTokens,
-      params.pricing,
-      "5m"
-    ),
-    recommendation: `Move the dynamic content at ${params.structuralPath} (wire-body offset ${params.divergenceByteOffset}) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.`
+    ...wasteFields(computeWaste(params.currentUsage, params.pricing, params.waste), [params.tier]),
+    recommendation: `Move the dynamic content at ${params.structuralPath} (canonical offset ${params.divergenceByteOffset}) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.`
   };
 }

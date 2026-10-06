@@ -2,11 +2,12 @@ import { type DiagnoseFinding, findAllDiagnoses } from "../core/diagnose/run.js"
 import type { Diagnosis } from "../core/diagnose/taxonomy.js";
 import type { LlmCall } from "../core/model/call.js";
 function renderTierBreakdown(diagnosis: Diagnosis): string[] {
-  if (diagnosis.invalidatedTiers.length <= 1) {
+  const byTier = diagnosis.wastedUsdByTier;
+  if (diagnosis.invalidatedTiers.length <= 1 || byTier === null) {
     return [];
   }
   const lines = diagnosis.invalidatedTiers.map((tier) => {
-    const tierWastedUsd = diagnosis.wastedUsdByTier.get(tier) ?? 0;
+    const tierWastedUsd = byTier.get(tier) ?? 0;
     return `    ${tier.padEnd(10)} ~$${tierWastedUsd.toFixed(4)}`;
   });
   return ["", "  wasted by tier (approximate — see docs):", ...lines];
@@ -19,7 +20,7 @@ function renderFinding(sessionId: string, call: LlmCall, diagnosis: Diagnosis): 
     "",
     `    ${diagnosis.excerpt}`,
     "",
-    `  wasted: ${diagnosis.wastedTokens} token${diagnosis.wastedTokens === 1 ? "" : "s"} (~$${diagnosis.wastedUsd.toFixed(4)})`,
+    `  wasted: ${diagnosis.wastedTokens} token${diagnosis.wastedTokens === 1 ? "" : "s"} (${diagnosis.wastedUsd === null ? "~$n/a, model unpriced" : `~$${diagnosis.wastedUsd.toFixed(4)}`})`,
     ...renderTierBreakdown(diagnosis),
     `  fix: ${diagnosis.recommendation}`
   ].join("\n");
@@ -46,8 +47,9 @@ export interface DiagnoseFindingJson {
   readonly structuralPath: string;
   readonly excerpt: string;
   readonly wastedTokens: number;
-  readonly wastedUsd: number;
-  readonly wastedUsdByTier: Record<string, number>;
+  /** Null when the model has no pricing entry. */
+  readonly wastedUsd: number | null;
+  readonly wastedUsdByTier: Record<string, number> | null;
   readonly recommendation: string;
 }
 function toFindingJson(finding: DiagnoseFinding): DiagnoseFindingJson {
@@ -63,7 +65,7 @@ function toFindingJson(finding: DiagnoseFinding): DiagnoseFindingJson {
     excerpt: diagnosis.excerpt,
     wastedTokens: diagnosis.wastedTokens,
     wastedUsd: diagnosis.wastedUsd,
-    wastedUsdByTier: Object.fromEntries(diagnosis.wastedUsdByTier),
+    wastedUsdByTier: diagnosis.wastedUsdByTier && Object.fromEntries(diagnosis.wastedUsdByTier),
     recommendation: diagnosis.recommendation
   };
 }

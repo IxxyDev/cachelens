@@ -9,7 +9,7 @@ session-1 / planner (call-2)
     ":"You are an agent. Current time: 2026-11-01T03:30:00Z.","type":"text"}][]
 
   wasted: 300 tokens (~$0.0010)
-  fix: Move the dynamic content at system[0].text (wire-body offset 49) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.
+  fix: Move the dynamic content at system[0].text (canonical offset 49) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.
 "
 `;
 

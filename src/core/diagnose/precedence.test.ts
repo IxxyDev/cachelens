@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { LlmCall } from "../model/call.js";
 import { byteOffset, tokenCount } from "../model/types.js";
 import { buildCanonicalRequest } from "../serialize/canonical-request.js";
-import { classifyMiss } from "./precedence.js";
+import { classifyMiss, stablePrefixText } from "./precedence.js";
+
 function makeCall(wireBody: unknown, timestamp: number): LlmCall {
   return {
     id: `call-${timestamp}`,
@@ -44,5 +45,25 @@ describe("classifyMiss", () => {
     expect(diagnosis?.cause).toBe("dynamic-prefix-content");
     expect(diagnosis?.invalidatedTiers).toEqual(["messages"]);
     expect(diagnosis?.structuralPath).toBe("messages");
+  });
+});
+describe("stablePrefixText", () => {
+  it("snaps a divergence offset inside a multibyte character back to its start, so the slice has no U+FFFD", () => {
+    // "é" (C3 A9) and "è" (C3 A8) share their lead byte, so the byte-level divergence lands
+    // between the two bytes of the character.
+    const previous = "prefix é";
+    const current = "prefix è";
+    const a = new TextEncoder().encode(previous);
+    const b = new TextEncoder().encode(current);
+    let divergence = 0;
+    while (a[divergence] === b[divergence]) divergence++;
+    expect(divergence).toBe(8);
+    const slice = stablePrefixText(current, byteOffset(divergence));
+    expect(slice).not.toContain("\uFFFD");
+    expect(slice).toBe("prefix ");
+  });
+  it("keeps an offset that already sits on a character boundary", () => {
+    expect(stablePrefixText("☕☕x", byteOffset(6))).toBe("☕☕");
+    expect(stablePrefixText("abc", byteOffset(99))).toBe("abc");
   });
 });

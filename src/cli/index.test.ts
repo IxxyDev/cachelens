@@ -104,7 +104,9 @@ describe("cli run()", () => {
       sessionId: "s1",
       stepName: "step",
       wireBody: { tools: [], system: "ts=1000", messages: [] },
-      timestamp: 0
+      timestamp: 0,
+      // The earlier call wrote its prefix: only tokens a hit could have reused count as waste.
+      usage: { cacheCreationInputTokens: tokenCount(500000) }
     }),
     makeCall({
       id: "call-2",

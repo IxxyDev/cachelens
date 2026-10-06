@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { PrefixDiffResult } from "../diff/prefix-diff.js";
 import type { LlmCall, Usage } from "../model/call.js";
 import { byteOffset, tokenCount } from "../model/types.js";
-import { type UsageGateParams, evaluateUsageGate } from "./gate.js";
+import { evaluateUsageGate, type UsageGateParams } from "./gate.js";
+
 const ONE_HOUR_MS = 60 * 60 * 1000;
 function makeUsage(overrides: Partial<Usage> = {}): Usage {
   return {
@@ -70,7 +71,7 @@ describe("evaluateUsageGate", () => {
     );
     expect(verdict).toEqual({ kind: "gap-exceeds-max-ttl" });
   });
-  it("returns no-op for a sub-min-cacheable prefix with no breakpoint and no cache activity (A2 true no-op)", () => {
+  it("returns no-op for a sub-min-cacheable prefix with no breakpoint and no cache activity", () => {
     const verdict = evaluateUsageGate(
       baseParams({
         breakpointDeclared: false,
@@ -125,7 +126,7 @@ describe("evaluateUsageGate", () => {
     );
     expect(verdict).toEqual({ kind: "miss", signature: "signature-1" });
   });
-  it("returns a signature-2 miss when a breakpoint is declared but nothing was read or created on a stable prefix (A1)", () => {
+  it("returns a signature-2 miss when a breakpoint is declared but nothing was read or created on a stable prefix", () => {
     const verdict = evaluateUsageGate(
       baseParams({
         breakpointDeclared: true,
@@ -134,6 +135,75 @@ describe("evaluateUsageGate", () => {
       })
     );
     expect(verdict).toEqual({ kind: "miss", signature: "signature-2" });
+  });
+});
+describe("evaluateUsageGate (signature-2 on a growing conversation)", () => {
+  it("routes a multi-turn loop that never activated caching (breakpoint, read 0, creation 0, appended turn) to a signature-2 miss, not no-op", () => {
+    const verdict = evaluateUsageGate(
+      baseParams({
+        breakpointDeclared: true,
+        prefixDiff: extensionPrefixDiff(),
+        current: makeCall(1000)
+      })
+    );
+    expect(verdict).toEqual({ kind: "miss", signature: "signature-2" });
+  });
+  it("routes a diverged request whose stable zone still meets the min-cacheable proxy to signature-2", () => {
+    const verdict = evaluateUsageGate(
+      baseParams({ breakpointDeclared: true, prefixDiff: divergedPrefixDiff(60) })
+    );
+    expect(verdict).toEqual({ kind: "miss", signature: "signature-2" });
+  });
+  it("control: a diverged request with a stable zone below the proxy stays no-op", () => {
+    const verdict = evaluateUsageGate(
+      baseParams({ breakpointDeclared: true, prefixDiff: divergedPrefixDiff(5) })
+    );
+    expect(verdict).toEqual({ kind: "no-op" });
+  });
+});
+describe("evaluateUsageGate (signature-3: breakpoint placed too early)", () => {
+  // Breakpoint at byte 100; the stable zone runs to byte 300, a min-cacheable proxy (50) past it.
+  const earlyBreakpoint = (usage: Partial<Usage>, previousUsage: Partial<Usage> = usage) =>
+    baseParams({
+      breakpointDeclared: true,
+      lastBreakpointOffset: 100,
+      previous: makeCall(0, previousUsage),
+      current: makeCall(1000, usage),
+      prefixDiff: {
+        identical: false,
+        previousIsPrefixOfCurrent: true,
+        divergenceByteOffset: byteOffset(300)
+      }
+    });
+  it("routes read > 0, creation == 0 with the stable zone well past the last breakpoint to signature-3, ahead of healthy-extension", () => {
+    // read (500) >= previous stable tokens (500) and the previous request is a prefix, so this
+    // shape also passes the healthy-extension test; nothing after the breakpoint was written.
+    const verdict = evaluateUsageGate(earlyBreakpoint({ cacheReadInputTokens: tokenCount(500) }));
+    expect(verdict).toEqual({ kind: "miss", signature: "signature-3" });
+  });
+  it("healthy-extension still wins when the appended turn was written (creation > 0)", () => {
+    const verdict = evaluateUsageGate(
+      earlyBreakpoint(
+        { cacheReadInputTokens: tokenCount(500), cacheCreationInputTokens: tokenCount(40) },
+        { cacheReadInputTokens: tokenCount(500) }
+      )
+    );
+    expect(verdict).toEqual({ kind: "healthy-extension" });
+  });
+  it("is not signature-3 when the stable zone passes the breakpoint by less than the min-cacheable proxy", () => {
+    const params = earlyBreakpoint({ cacheReadInputTokens: tokenCount(500) });
+    const verdict = evaluateUsageGate({ ...params, lastBreakpointOffset: 260 });
+    expect(verdict).toEqual({ kind: "healthy-extension" });
+  });
+  it("is not signature-3 without a breakpoint offset or with nothing read", () => {
+    const { lastBreakpointOffset: _omit, ...withoutOffset } = earlyBreakpoint({
+      cacheReadInputTokens: tokenCount(500)
+    });
+    expect(evaluateUsageGate(withoutOffset)).toEqual({ kind: "healthy-extension" });
+    expect(evaluateUsageGate(earlyBreakpoint({}))).not.toEqual({
+      kind: "miss",
+      signature: "signature-3"
+    });
   });
 });
 describe("evaluateUsageGate (provider: openai)", () => {

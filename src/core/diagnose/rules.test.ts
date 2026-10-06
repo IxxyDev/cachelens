@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { LlmCall } from "../model/call.js";
+import { locateBreakpoints } from "../breakpoints/locate.js";
+import { diffPrefix } from "../diff/prefix-diff.js";
+import type { LlmCall, Usage } from "../model/call.js";
 import { byteOffset, tokenCount, usd } from "../model/types.js";
 import { getModelPricing } from "../pricing/table.js";
-import { buildCanonicalRequest } from "../serialize/canonical-request.js";
+import {
+  buildCanonicalRequest,
+  canonicalPrefixComparisonText
+} from "../serialize/canonical-request.js";
 import { tierSegment } from "../serialize/segment-map.js";
 import {
   buildDynamicPrefixContentDiagnosis,
@@ -12,8 +17,10 @@ import {
   checkPrefixTooShort,
   checkRequestParamInvalidation,
   checkToolsTierDrift,
-  checkTtlExpiry
+  checkTtlExpiry,
+  computeWaste
 } from "./rules.js";
+
 const pricing = getModelPricing("claude-sonnet-4-5");
 function makeCall(wireBody: unknown, overrides: Partial<LlmCall> = {}): LlmCall {
   return {
@@ -171,7 +178,75 @@ describe("checkToolsTierDrift wastedUsdByTier", () => {
     expect(sumMap(diagnosis.wastedUsdByTier)).toBeCloseTo(diagnosis.wastedUsd, 6);
   });
 });
+function usageOf(overrides: Partial<Usage>): Usage {
+  return {
+    inputTokens: tokenCount(0),
+    outputTokens: tokenCount(0),
+    cacheCreationInputTokens: tokenCount(0),
+    cacheReadInputTokens: tokenCount(0),
+    ...overrides
+  };
+}
+/** system: [cached head (breakpoint), stable middle, dynamic tail] — the breakpoint sits too early. */
+function misplacementInputs(currentUsage: Usage) {
+  const makeBody = (tail: string) =>
+    JSON.stringify({
+      tools: [],
+      system: [
+        { type: "text", text: "H".repeat(200), cache_control: { type: "ephemeral" } },
+        { type: "text", text: "M".repeat(200) },
+        { type: "text", text: tail }
+      ],
+      messages: []
+    });
+  const previous = buildCanonicalRequest(makeBody("tail-a"));
+  const currentBody = makeBody("tail-b");
+  const current = buildCanonicalRequest(currentBody);
+  return {
+    prefixDiff: diffPrefix(
+      canonicalPrefixComparisonText(previous),
+      canonicalPrefixComparisonText(current)
+    ),
+    currentBreakpoints: locateBreakpoints(currentBody, current.segments),
+    currentUsage,
+    minCacheableBytesProxy: 10,
+    currentSegments: current.segments,
+    canonicalCurrentText: current.text,
+    pricing
+  };
+}
 describe("checkBreakpointMisplacement", () => {
+  it("fires when part of the prefix was read and a whole stable block follows the breakpoint, snapping the offset to that block's end", () => {
+    const inputs = misplacementInputs(
+      usageOf({ cacheReadInputTokens: tokenCount(60), cacheCreationInputTokens: tokenCount(40) })
+    );
+    const diagnosis = checkBreakpointMisplacement(inputs);
+    expect(diagnosis?.cause).toBe("breakpoint-misplacement");
+    const middleBlock = inputs.currentSegments.find((s) => s.structuralPath === "system[1]");
+    expect(diagnosis?.structuralPath).toBe("system[1]");
+    expect(diagnosis?.byteOffset).toBe(middleBlock?.end);
+    // A block boundary, not the mid-string divergence offset inside system[2].
+    expect(diagnosis?.byteOffset).toBeLessThan(inputs.prefixDiff.divergenceByteOffset);
+    expect(diagnosis?.recommendation).toContain("end of system[1]");
+    expect(diagnosis?.invalidatedTiers).toEqual(["system"]);
+  });
+  it("does not fire when cache_read is 0: the content before the breakpoint missed too, which moving the breakpoint cannot explain", () => {
+    const inputs = misplacementInputs(usageOf({ cacheCreationInputTokens: tokenCount(100) }));
+    expect(checkBreakpointMisplacement(inputs)).toBeNull();
+  });
+  it("does not fire when no whole block lies between the breakpoint and the end of the stable zone", () => {
+    const inputs = misplacementInputs(
+      usageOf({ cacheReadInputTokens: tokenCount(60), cacheCreationInputTokens: tokenCount(40) })
+    );
+    const middleEnd = inputs.currentSegments.find((s) => s.structuralPath === "system[1]")?.end;
+    const lateBreakpoints = inputs.currentBreakpoints.map((bp) => ({
+      ...bp,
+      byteOffset: byteOffset(middleEnd ?? 0)
+    }));
+    expect(
+      checkBreakpointMisplacement({ ...inputs, currentBreakpoints: lateBreakpoints })
+    ).toBeNull();
+  });
   it("returns null when the breakpoint is already at or after the stable boundary (not misplaced)", () => {
     const diagnosis = checkBreakpointMisplacement({
       prefixDiff: {
@@ -180,12 +255,10 @@ describe("checkBreakpointMisplacement", () => {
         divergenceByteOffset: byteOffset(50)
       },
       currentBreakpoints: [{ byteOffset: byteOffset(50), index: 0, ttl: "5m", tier: "system" }],
-      currentUsage: {
-        inputTokens: tokenCount(0),
-        outputTokens: tokenCount(0),
+      currentUsage: usageOf({
         cacheCreationInputTokens: tokenCount(300),
-        cacheReadInputTokens: tokenCount(0)
-      },
+        cacheReadInputTokens: tokenCount(10)
+      }),
       minCacheableBytesProxy: 10,
       currentSegments: [],
       canonicalCurrentText: "x".repeat(60),
@@ -193,26 +266,149 @@ describe("checkBreakpointMisplacement", () => {
     });
     expect(diagnosis).toBeNull();
   });
-  it("returns null when usage shows both creation and reads (not the misplacement signature)", () => {
-    const diagnosis = checkBreakpointMisplacement({
+});
+describe("checkTtlExpiry on a growing conversation", () => {
+  it("fires when the previous request is a strict prefix of the current one (an appended turn) and the gap exceeds the TTL", () => {
+    const previous = makeCall(
+      { tools: [], system: "x", messages: [{ role: "user", content: "q1" }] },
+      { timestamp: 0, usage: usageOf({ cacheCreationInputTokens: tokenCount(300) }) }
+    );
+    const current = makeCall(
+      {
+        tools: [],
+        system: "x",
+        messages: [
+          { role: "user", content: "q1" },
+          { role: "assistant", content: "a1" }
+        ]
+      },
+      { timestamp: 10 * 60 * 1000, usage: usageOf({ cacheCreationInputTokens: tokenCount(350) }) }
+    );
+    const diagnosis = checkTtlExpiry({
+      previous,
+      current,
+      previousBreakpoints: [{ byteOffset: byteOffset(5), index: 0, ttl: "5m", tier: "system" }],
+      prefixDiff: {
+        identical: false,
+        previousIsPrefixOfCurrent: true,
+        divergenceByteOffset: byteOffset(40)
+      },
+      pricing
+    });
+    expect(diagnosis?.cause).toBe("ttl-expiry");
+    expect(diagnosis?.excerpt).toContain("extends the previous call");
+    // The 50 appended tokens had to be written anyway: only the 300 the cache held are waste.
+    expect(diagnosis?.wastedTokens).toBe(300);
+  });
+  it("does not fire when the prefix genuinely diverged (neither identical nor extended)", () => {
+    const previous = makeCall({ tools: [], system: "x", messages: [] }, { timestamp: 0 });
+    const current = makeCall(
+      { tools: [], system: "y", messages: [] },
+      { timestamp: 10 * 60 * 1000 }
+    );
+    const diagnosis = checkTtlExpiry({
+      previous,
+      current,
+      previousBreakpoints: [],
       prefixDiff: {
         identical: false,
         previousIsPrefixOfCurrent: false,
-        divergenceByteOffset: byteOffset(50)
+        divergenceByteOffset: byteOffset(20)
       },
-      currentBreakpoints: [{ byteOffset: byteOffset(10), index: 0, ttl: "5m", tier: "system" }],
-      currentUsage: {
-        inputTokens: tokenCount(0),
-        outputTokens: tokenCount(0),
-        cacheCreationInputTokens: tokenCount(100),
-        cacheReadInputTokens: tokenCount(50)
-      },
-      minCacheableBytesProxy: 10,
-      currentSegments: [],
-      canonicalCurrentText: "x".repeat(60),
       pricing
     });
     expect(diagnosis).toBeNull();
+  });
+  it("prices a 1h-TTL expiry at the 2x write multiplier", () => {
+    const wireBody = { tools: [], system: "x", messages: [] };
+    const previous = makeCall(wireBody, {
+      timestamp: 0,
+      usage: usageOf({ cacheReadInputTokens: tokenCount(1_000_000) })
+    });
+    const current = makeCall(wireBody, {
+      timestamp: 2 * 60 * 60 * 1000,
+      usage: usageOf({ cacheCreationInputTokens: tokenCount(1_000_000) })
+    });
+    const diagnosis = checkTtlExpiry({
+      previous,
+      current,
+      previousBreakpoints: [{ byteOffset: byteOffset(5), index: 0, ttl: "1h", tier: "system" }],
+      prefixDiff: {
+        identical: true,
+        previousIsPrefixOfCurrent: true,
+        divergenceByteOffset: byteOffset(0)
+      },
+      pricing
+    });
+    // sonnet-4-5: $3/MTok input, 2x write vs 0.1x read.
+    expect(diagnosis?.wastedUsd).toBeCloseTo(3 * (2 - 0.1), 6);
+  });
+});
+describe("checkTtlExpiry write TTL", () => {
+  it("prices the expiry at the previous call's 1h TTL even when the waste basis carries the current call's 5m TTL", () => {
+    const wireBody = { tools: [], system: "x", messages: [] };
+    const previous = makeCall(wireBody, {
+      timestamp: 0,
+      usage: usageOf({ cacheReadInputTokens: tokenCount(1_000_000) })
+    });
+    const current = makeCall(wireBody, {
+      timestamp: 2 * 60 * 60 * 1000,
+      usage: usageOf({ cacheCreationInputTokens: tokenCount(1_000_000) })
+    });
+    const diagnosis = checkTtlExpiry({
+      previous,
+      current,
+      previousBreakpoints: [{ byteOffset: byteOffset(5), index: 0, ttl: "1h", tier: "system" }],
+      prefixDiff: {
+        identical: true,
+        previousIsPrefixOfCurrent: true,
+        divergenceByteOffset: byteOffset(0)
+      },
+      pricing,
+      waste: { writeTtl: "5m" }
+    });
+    expect(diagnosis?.wastedUsd).toBeCloseTo(3 * (2 - 0.1), 6);
+  });
+});
+describe("computeWaste", () => {
+  it("caps waste at what the previous call held, so newly appended content in a growing conversation is never waste", () => {
+    // Turn N held 1000 cached tokens; turn N+1 changed a timestamp at the start and appended a
+    // 500-token turn, so it re-wrote 1500. Only the 1000 that could have been read are waste.
+    const waste = computeWaste(usageOf({ cacheCreationInputTokens: tokenCount(1500) }), pricing, {
+      previousUsage: usageOf({
+        cacheReadInputTokens: tokenCount(800),
+        cacheCreationInputTokens: tokenCount(200)
+      })
+    });
+    expect(waste.wastedTokens).toBe(1000);
+    expect(waste.wastedUsd).toBeCloseTo((1000 / 1_000_000) * 3 * (1.25 - 0.1), 9);
+  });
+  it("prices the reported 5m/1h split at 1.25x/2x respectively", () => {
+    const waste = computeWaste(
+      usageOf({
+        cacheCreationInputTokens: tokenCount(248),
+        cacheCreation5mInputTokens: tokenCount(148),
+        cacheCreation1hInputTokens: tokenCount(100)
+      }),
+      pricing
+    );
+    const expected = (3 / 1_000_000) * (148 * (1.25 - 0.1) + 100 * (2 - 0.1));
+    expect(waste.wastedTokens).toBe(248);
+    expect(waste.wastedUsd).toBeCloseTo(expected, 12);
+  });
+  it("estimates OpenAI waste from the stable zone's share of the prompt, since OpenAI reports no cache writes", () => {
+    const gpt4o = getModelPricing("gpt-4o");
+    const waste = computeWaste(usageOf({ inputTokens: tokenCount(2000) }), gpt4o, {
+      provider: "openai",
+      stableBytes: 6000,
+      totalBytes: 8000,
+      previousUsage: usageOf({})
+    });
+    expect(waste.wastedEstimate).toBe(true);
+    expect(waste.wastedTokens).toBe(1500);
+    const expected = (1500 / 1_000_000) * gpt4o.inputPricePerMTok * (1 - gpt4o.cacheReadMultiplier);
+    expect(waste.wastedUsd).toBeCloseTo(expected, 12);
+    expect(waste.wastedUsd).toBeGreaterThan(0);
   });
 });
 describe("checkTtlExpiry", () => {
@@ -479,21 +675,9 @@ describe("provider gating: breakpoint-family causes never fire for a non-anthrop
     cacheReadInputTokens: tokenCount(0)
   };
   it("checkBreakpointMisplacement", () => {
-    const base = {
-      prefixDiff: {
-        identical: false,
-        previousIsPrefixOfCurrent: false,
-        divergenceByteOffset: byteOffset(50)
-      },
-      currentBreakpoints: [
-        { byteOffset: byteOffset(10), index: 0, ttl: "5m" as const, tier: "system" as const }
-      ],
-      currentUsage: missUsage,
-      minCacheableBytesProxy: 10,
-      currentSegments: [],
-      canonicalCurrentText: "x".repeat(60),
-      pricing
-    };
+    const base = misplacementInputs(
+      usageOf({ cacheReadInputTokens: tokenCount(60), cacheCreationInputTokens: tokenCount(40) })
+    );
     expect(checkBreakpointMisplacement(base)).not.toBeNull();
     expect(checkBreakpointMisplacement({ ...base, provider: "openai" as const })).toBeNull();
   });

@@ -30,8 +30,9 @@ export function evaluateCheck(
   options: DiagnoseOptions = {}
 ): CheckResult {
   const findings = findAllDiagnoses(calls, options);
+  // Findings on unpriced models carry no dollar figure.
   const totalWastedUsd = usd(
-    findings.reduce((sum, finding) => sum + finding.diagnosis.wastedUsd, 0)
+    findings.reduce((sum, finding) => sum + (finding.diagnosis.wastedUsd ?? 0), 0)
   );
   const hitRate = aggregateHitRate(calls);
   const totalCostUsd = usd(
