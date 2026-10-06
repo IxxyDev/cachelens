@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LlmCall, Usage } from "../model/call.js";
 import { tokenCount } from "../model/types.js";
 import { aggregateHitRate } from "./hitrate.js";
+
 function makeCall(usage: Partial<Usage>): LlmCall {
   return {
     id: "call-1",

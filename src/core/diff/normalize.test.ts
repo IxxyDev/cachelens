@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalizeSortedKeys, normalizedJsonEquals } from "./normalize.js";
+import { normalizedJsonEquals, normalizeSortedKeys } from "./normalize.js";
+
 describe("normalizeSortedKeys", () => {
   it("sorts object keys recursively", () => {
     expect(normalizeSortedKeys({ b: 1, a: { d: 1, c: 2 } })).toEqual({ a: { c: 2, d: 1 }, b: 1 });

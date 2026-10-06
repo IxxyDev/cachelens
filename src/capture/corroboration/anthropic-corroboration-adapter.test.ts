@@ -3,6 +3,7 @@ import type { LlmCall } from "../../core/model/call.js";
 import { tokenCount } from "../../core/model/types.js";
 import type { FetchLike, FetchResponseLike } from "../wrap/anthropic.js";
 import { createAnthropicCorroborationAdapter } from "./anthropic-corroboration-adapter.js";
+
 function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500): FetchResponseLike {
   return {
     ok,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolveProvider } from "./provider.js";
+
 describe("resolveProvider", () => {
   it("defaults to anthropic when provider is absent (back-compat with traces recorded before the provider field existed)", () => {
     expect(resolveProvider({})).toBe("anthropic");

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -13,10 +16,10 @@ jobs:
       matrix:
         node-version: [22.x, 24.x]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -30,11 +33,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test (with coverage, per-file thresholds enforced)
-        run: npm run test:coverage
-
+      # Built before the tests: src/e2e/cli.test.ts and src/cli/bin-entry.test.ts
+      # spawn dist/cli/index.js as a separate process.
       - name: Build
         run: npm run build
+
+      - name: Test (with coverage, per-file thresholds enforced)
+        run: npm run test:coverage
 
       # Dogfooding: cachelens gates its own repo. `fixtures/demo-agent/fixed.jsonl`
       # is the golden "fixed" trace from the naive-vs-fixed demo dataset — its

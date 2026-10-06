@@ -2,7 +2,14 @@
   "name": "cachelens",
   "version": "1.0.0",
   "description": "Internal token-economics profiler for LLM agent pipelines: cost distribution, cache hit rate, and byte-level prompt-cache-miss root-cause diagnostics, run as a CI gate.",
-  "keywords": ["llm", "prompt-caching", "cost-observability", "cli", "ci-gate", "anthropic"],
+  "keywords": [
+    "llm",
+    "prompt-caching",
+    "cost-observability",
+    "cli",
+    "ci-gate",
+    "anthropic"
+  ],
   "type": "module",
   "private": true,
   "engines": {
@@ -26,27 +33,27 @@
       "default": "./dist/store/jsonl.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "generate:demo-fixtures": "npm run build && node dist/scripts/generate-demo-fixtures.js"
   },
   "license": "MIT",
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
+    "@biomejs/biome": "^2.5.15",
     "@types/node": "^22.10.2",
-    "@vitest/coverage-v8": "^2.1.8",
+    "@vitest/coverage-v8": "^5.0.3",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
-  },
-  "allowScripts": {
-    "@biomejs/biome@1.9.4": true,
-    "esbuild@0.21.5": true
+    "vitest": "^5.0.3"
   }
 }

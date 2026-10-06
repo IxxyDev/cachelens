@@ -1,6 +1,7 @@
 import { tokenCount } from "../../core/model/types.js";
 import type { CountTokensAdapter } from "../../core/pricing/count-tokens.js";
 import type { FetchLike } from "../wrap/anthropic.js";
+
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 const COUNT_TOKENS_PATH = "/v1/messages/count_tokens";

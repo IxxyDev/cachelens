@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LlmCall } from "../core/model/call.js";
 import { tokenCount } from "../core/model/types.js";
 import { MemoryTraceStore } from "./memory-store.js";
+
 function makeCall(id: string): LlmCall {
   return {
     id,

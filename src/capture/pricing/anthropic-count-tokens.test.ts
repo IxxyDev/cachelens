@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { FetchLike, FetchResponseLike } from "../wrap/anthropic.js";
 import { createAnthropicCountTokensAdapter } from "./anthropic-count-tokens.js";
+
 function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500): FetchResponseLike {
   return {
     ok,

@@ -1,6 +1,7 @@
 import type { CorroborationAdapter } from "../../core/diagnose/corroboration.js";
 import type { Corroboration, CorroborationStatus } from "../../core/diagnose/taxonomy.js";
 import type { FetchLike, FetchResponseLike } from "../wrap/anthropic.js";
+
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 const UNCONFIRMED_BETA_PATH = "/v1/messages/cache-diagnostics";

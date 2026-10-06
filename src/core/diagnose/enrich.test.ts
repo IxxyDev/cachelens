@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { LlmCall } from "../model/call.js";
-import { tokenCount } from "../model/types.js";
-import { byteOffset, usd } from "../model/types.js";
+import { byteOffset, tokenCount, usd } from "../model/types.js";
 import type { CorroborationAdapter } from "./corroboration.js";
 import type { EngineResult } from "./engine.js";
 import { enrichDiagnosis, enrichEngineResult } from "./enrich.js";
 import type { Diagnosis } from "./taxonomy.js";
+
 function makeCall(): LlmCall {
   return {
     id: "call-1",
