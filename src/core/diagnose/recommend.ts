@@ -1,6 +1,8 @@
 import type { ByteOffset } from "../model/types.js";
 import { computeWastedUsd } from "../pricing/cost.js";
+
 export { computeWastedUsd };
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 export function excerptAroundByteOffset(text: string, offset: ByteOffset, context = 40): string {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LlmCall } from "../model/call.js";
 import { tokenCount } from "../model/types.js";
 import { costDistributionByStep } from "./distribution.js";
+
 function makeCall(
   id: string,
   stepName: string,
@@ -66,5 +67,39 @@ describe("costDistributionByStep (provider-aware via per-model pricing lookup)",
     };
     const [entry] = costDistributionByStep([call]);
     expect(entry?.totalUsd).toBeCloseTo(2.5 * 0.5, 6);
+  });
+});
+describe("costDistributionByStep (cache-write TTL)", () => {
+  it("prices writes of a call whose breakpoints are all 1h at 2x, and at 1.25x otherwise", () => {
+    const makeWriteCall = (id: string, stepName: string, ttl?: "1h"): LlmCall => ({
+      id,
+      sessionId: "session-1",
+      stepName,
+      timestamp: 0,
+      params: { model: "claude-sonnet-4-5" },
+      payload: {
+        wireBody: JSON.stringify({
+          system: [
+            {
+              type: "text",
+              text: "x",
+              cache_control: { type: "ephemeral", ...(ttl ? { ttl } : {}) }
+            }
+          ]
+        })
+      },
+      usage: {
+        inputTokens: tokenCount(0),
+        outputTokens: tokenCount(0),
+        cacheCreationInputTokens: tokenCount(1000000),
+        cacheReadInputTokens: tokenCount(0)
+      }
+    });
+    const dist = costDistributionByStep([
+      makeWriteCall("1", "one-hour", "1h"),
+      makeWriteCall("2", "five-minute")
+    ]);
+    expect(dist.find((d) => d.stepName === "one-hour")?.totalUsd).toBeCloseTo(3 * 2, 6);
+    expect(dist.find((d) => d.stepName === "five-minute")?.totalUsd).toBeCloseTo(3 * 1.25, 6);
   });
 });

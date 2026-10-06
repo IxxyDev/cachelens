@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
+import type { LlmCall } from "../model/call.js";
 import type { CacheTier } from "../model/tier.js";
 import { tokenCount } from "../model/types.js";
-import { computeCallCost, computeTieredCounterfactual, computeWastedUsd } from "./cost.js";
+import {
+  cacheWriteSplit,
+  computeCallCost,
+  computeTieredCounterfactual,
+  computeWastedUsd,
+  declaredWriteTtl,
+  writeMultiplierFor
+} from "./cost.js";
 import { getModelPricing } from "./table.js";
+
 describe("computeCallCost", () => {
   const pricing = getModelPricing("claude-sonnet-4-5");
   it("prices a call with no cache activity as plain input + output", () => {
@@ -72,6 +81,28 @@ describe("computeCallCost", () => {
     expect(cost).toBeCloseTo(expected, 6);
   });
 });
+describe("computeCallCost (per-model cache-read multiplier)", () => {
+  const oneMillionCacheRead = {
+    inputTokens: tokenCount(0),
+    outputTokens: tokenCount(0),
+    cacheCreationInputTokens: tokenCount(0),
+    cacheReadInputTokens: tokenCount(1000000)
+  };
+  it("prices a 1M-token cache read on claude-opus-5-5 at $0.20 (0.05x of $4)", () => {
+    expect(
+      computeCallCost(oneMillionCacheRead, getModelPricing("claude-opus-5-5"), "5m")
+    ).toBeCloseTo(0.2, 10);
+  });
+  it("prices a 1M-token cache read on claude-fable-5-1 at $0.25 (0.025x of $10)", () => {
+    expect(
+      computeCallCost(oneMillionCacheRead, getModelPricing("claude-fable-5-1"), "5m")
+    ).toBeCloseTo(0.25, 10);
+  });
+  it("computeWastedUsd subtracts the model's own read multiplier", () => {
+    const wasted = computeWastedUsd(tokenCount(1000000), getModelPricing("claude-opus-5-5"), "5m");
+    expect(wasted).toBeCloseTo(4 * (1.25 - 0.05), 10);
+  });
+});
 describe("computeCallCost (OpenAI provider — no write premium, provider-specific read discount)", () => {
   const openaiPricing = getModelPricing("gpt-4o");
   it("prices cache-creation tokens at plain 1x (no write premium), unlike Anthropic's 1.25x/2.0x", () => {
@@ -87,7 +118,7 @@ describe("computeCallCost (OpenAI provider — no write premium, provider-specif
     );
     expect(cost).toBeCloseTo(2.5, 6);
   });
-  it("applies the model's own cacheReadMultiplier instead of Anthropic's 0.1x default", () => {
+  it("applies the model's own cacheReadMultiplier (0.5x for gpt-4o)", () => {
     const cost = computeCallCost(
       {
         inputTokens: tokenCount(0),
@@ -172,5 +203,64 @@ describe("computeTieredCounterfactual", () => {
       ttl: "5m"
     });
     expect(result.wastedUsdByTier.get("system")).toBe(0);
+  });
+});
+describe("TTL-aware cache-write pricing", () => {
+  const pricing = getModelPricing("claude-sonnet-4-5");
+  function callWithSystem(
+    cacheControl: Record<string, unknown> | undefined,
+    usage: Partial<LlmCall["usage"]> = {}
+  ): LlmCall {
+    return {
+      id: "c",
+      sessionId: "s",
+      stepName: "step",
+      timestamp: 0,
+      params: { model: "claude-sonnet-4-5" },
+      payload: {
+        wireBody: JSON.stringify({
+          system: [
+            { type: "text", text: "x", ...(cacheControl ? { cache_control: cacheControl } : {}) }
+          ],
+          messages: []
+        })
+      },
+      usage: {
+        inputTokens: tokenCount(0),
+        outputTokens: tokenCount(0),
+        cacheCreationInputTokens: tokenCount(1000000),
+        cacheReadInputTokens: tokenCount(0),
+        ...usage
+      }
+    };
+  }
+  it("a 1h write costs 2x the base input price", () => {
+    const call = callWithSystem({ type: "ephemeral", ttl: "1h" });
+    expect(declaredWriteTtl(call)).toBe("1h");
+    expect(writeMultiplierFor(call, pricing)).toBe(2);
+    expect(computeCallCost(call.usage, pricing, declaredWriteTtl(call))).toBeCloseTo(3 * 2, 6);
+  });
+  it("a call with no breakpoint, a 5m breakpoint, or an unparseable body falls back to 5m (1.25x)", () => {
+    expect(declaredWriteTtl(callWithSystem(undefined))).toBe("5m");
+    expect(declaredWriteTtl(callWithSystem({ type: "ephemeral" }))).toBe("5m");
+    const broken = { ...callWithSystem(undefined), payload: { wireBody: "{oops" } };
+    expect(declaredWriteTtl(broken)).toBe("5m");
+    expect(writeMultiplierFor(callWithSystem({ type: "ephemeral" }), pricing)).toBe(1.25);
+  });
+  it("prices a reported 148/100 split at 1.25x/2x respectively, regardless of the fallback TTL", () => {
+    const usage = {
+      inputTokens: tokenCount(0),
+      outputTokens: tokenCount(0),
+      cacheCreationInputTokens: tokenCount(248),
+      cacheCreation5mInputTokens: tokenCount(148),
+      cacheCreation1hInputTokens: tokenCount(100),
+      cacheReadInputTokens: tokenCount(0)
+    };
+    expect(cacheWriteSplit(usage, "1h")).toEqual({ tokens5m: 148, tokens1h: 100 });
+    const expected = (3 / 1000000) * (148 * 1.25 + 100 * 2);
+    expect(computeCallCost(usage, pricing, "5m")).toBeCloseTo(expected, 12);
+    expect(computeCallCost(usage, pricing, "1h")).toBeCloseTo(expected, 12);
+    const call = callWithSystem({ type: "ephemeral" }, usage);
+    expect(writeMultiplierFor(call, pricing)).toBeCloseTo((148 * 1.25 + 100 * 2) / 248, 12);
   });
 });

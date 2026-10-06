@@ -21,12 +21,12 @@ session-1 / planner (call-2)
 
     model: "claude-sonnet-4-5" -> "claude-opus-4-5"
 
-  wasted: 300 tokens (~$0.0052)
+  wasted: 300 tokens (~$0.0017)
 
   wasted by tier (approximate — see docs):
-    tools      ~$0.0008
-    system     ~$0.0031
-    messages   ~$0.0013
+    tools      ~$0.0003
+    system     ~$0.0010
+    messages   ~$0.0004
   fix: Keep \`model\` (and tool definitions) fixed for this step — a model change invalidates the entire cache prefix, all tiers.
 "
 `;

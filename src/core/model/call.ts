@@ -5,6 +5,10 @@ export interface Usage {
   readonly outputTokens: TokenCount;
   readonly cacheCreationInputTokens: TokenCount;
   readonly cacheReadInputTokens: TokenCount;
+  /** Anthropic `usage.cache_creation.ephemeral_5m_input_tokens`, when reported. */
+  readonly cacheCreation5mInputTokens?: TokenCount;
+  /** Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`, when reported. */
+  readonly cacheCreation1hInputTokens?: TokenCount;
 }
 export interface RequestParams {
   readonly model: string;

@@ -5,6 +5,7 @@ import {
   hashPrefix,
   offlineCountTokensAdapter
 } from "./count-tokens.js";
+
 describe("offlineCountTokensAdapter", () => {
   it("always resolves to undefined (cannot confirm, never a guess)", async () => {
     await expect(offlineCountTokensAdapter.countTokens("anything")).resolves.toBeUndefined();
@@ -16,6 +17,14 @@ describe("hashPrefix", () => {
   });
   it("differs for different input", () => {
     expect(hashPrefix("a")).not.toBe(hashPrefix("b"));
+  });
+  it("is a SHA-256 hex digest", () => {
+    expect(hashPrefix("hello world")).toBe(
+      "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+  });
+  it("separates inputs whose 32-bit DJB2 hashes collide (both 0x3c433f2e)", () => {
+    expect(hashPrefix("ovfbcbckvlnk")).not.toBe(hashPrefix("ipwroqzwfgtq"));
   });
 });
 describe("cachingCountTokensAdapter", () => {

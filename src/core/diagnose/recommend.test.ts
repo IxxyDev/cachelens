@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 import { byteOffset, tokenCount, usd } from "../model/types.js";
 import type { ModelPricing } from "../pricing/table.js";
 import { computeWastedUsd, excerptAroundByteOffset } from "./recommend.js";
+
 const PRICING: ModelPricing = {
   model: "test-model",
   provider: "anthropic",
   inputPricePerMTok: usd(3),
   outputPricePerMTok: usd(15),
-  minCacheableTokens: tokenCount(1024)
+  minCacheableTokens: tokenCount(1024),
+  cacheReadMultiplier: 0.1,
+  cacheWrite5mMultiplier: 1.25,
+  cacheWrite1hMultiplier: 2
 };
 describe("computeWastedUsd", () => {
   it("computes the extra cost of a write vs. a read at the 5m multiplier", () => {
