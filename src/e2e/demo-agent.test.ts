@@ -2,9 +2,10 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { costDistributionByStep } from "../core/aggregate/distribution.js";
 import { aggregateHitRate } from "../core/aggregate/hitrate.js";
-import { type EngineResult, diagnoseCall } from "../core/diagnose/engine.js";
+import { diagnoseCall, type EngineResult } from "../core/diagnose/engine.js";
 import type { LlmCall } from "../core/model/call.js";
 import { readJsonlFile } from "../store/jsonl.js";
+
 const NAIVE_TRACE = fileURLToPath(
   new URL("../../fixtures/demo-agent/naive.jsonl", import.meta.url)
 );
@@ -37,14 +38,14 @@ function diagnoseTrace(calls: readonly LlmCall[]): DiagnosedCall[] {
 }
 describe("golden demo-agent e2e gate", () => {
   it("fixture files exist and are non-empty", async () => {
-    const naive = await readJsonlFile(NAIVE_TRACE);
-    const fixed = await readJsonlFile(FIXED_TRACE);
+    const naive = (await readJsonlFile(NAIVE_TRACE)).calls;
+    const fixed = (await readJsonlFile(FIXED_TRACE)).calls;
     expect(naive.length).toBeGreaterThan(0);
     expect(fixed.length).toBeGreaterThan(0);
     expect(naive.length).toBe(fixed.length);
   });
   it("naive: every non-cold-start turn is diagnosed as dynamic-prefix-content with an exact byteOffset+structuralPath", async () => {
-    const calls = await readJsonlFile(NAIVE_TRACE);
+    const calls = (await readJsonlFile(NAIVE_TRACE)).calls;
     const diagnosed = diagnoseTrace(calls);
     const nonColdStart = diagnosed.filter((d) => d.result.kind !== "cold-start");
     expect(nonColdStart.length).toBeGreaterThan(0);
@@ -61,7 +62,7 @@ describe("golden demo-agent e2e gate", () => {
     }
   });
   it("fixed: no call is ever diagnosed with a cache-miss cause — false-miss gate", async () => {
-    const calls = await readJsonlFile(FIXED_TRACE);
+    const calls = (await readJsonlFile(FIXED_TRACE)).calls;
     const diagnosed = diagnoseTrace(calls);
     for (const { call, result } of diagnosed) {
       expect(result.kind, `unexpected miss for ${call.id}: ${JSON.stringify(result)}`).not.toBe(
@@ -73,8 +74,8 @@ describe("golden demo-agent e2e gate", () => {
     expect(diagnosed.some((d) => d.result.kind === "healthy-extension")).toBe(true);
   });
   it("shows a real dollar delta and hit-rate improvement between naive and fixed", async () => {
-    const naive = await readJsonlFile(NAIVE_TRACE);
-    const fixed = await readJsonlFile(FIXED_TRACE);
+    const naive = (await readJsonlFile(NAIVE_TRACE)).calls;
+    const fixed = (await readJsonlFile(FIXED_TRACE)).calls;
     const naiveCost = costDistributionByStep(naive).reduce((sum, entry) => sum + entry.totalUsd, 0);
     const fixedCost = costDistributionByStep(fixed).reduce((sum, entry) => sum + entry.totalUsd, 0);
     expect(naiveCost).toBeGreaterThan(fixedCost);

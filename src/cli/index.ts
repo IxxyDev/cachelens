@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { DEFAULT_UPSTREAM_BASE_URL, startProxy } from "../capture/proxy/start-proxy.js";
 import { evaluateCheck } from "../core/check/evaluate.js";
 import type { LlmCall } from "../core/model/call.js";
-import { JsonlTraceStore, readJsonlFile } from "../store/jsonl.js";
+import { JsonlTraceStore, type ReadJsonlResult, readJsonlFile } from "../store/jsonl.js";
 import { renderCheck, renderCheckJson } from "./check.js";
 import { renderDiagnose, renderDiagnoseJson } from "./diagnose.js";
 import { renderReport, renderReportHtml, renderReportJson } from "./report.js";
@@ -174,13 +174,20 @@ function printHelp(io: CliIo): void {
     ].join("\n")
   );
 }
-async function readTraceOrThrow(traceFile: string): Promise<LlmCall[]> {
+async function readTraceFile(traceFile: string, io: CliIo): Promise<ReadJsonlResult> {
   try {
     await access(traceFile);
   } catch {
     throw new Error(`Trace file not found: ${traceFile}`);
   }
-  return readJsonlFile(traceFile);
+  const trace = await readJsonlFile(traceFile);
+  for (const warning of trace.warnings) {
+    io.writeErr(`warning: ${warning}\n`);
+  }
+  if (trace.calls.length === 0 && trace.warnings.length > 0) {
+    throw new Error(`No valid calls in trace: ${traceFile}`);
+  }
+  return trace;
 }
 async function runReport(args: readonly string[], io: CliIo): Promise<number> {
   const parsed = parseFlags(args);
@@ -193,7 +200,7 @@ async function runReport(args: readonly string[], io: CliIo): Promise<number> {
     io.writeErr("Usage: cachelens report <trace.jsonl> [--json] [--html <out.html>]\n");
     return EXIT_ERROR;
   }
-  const calls = await readTraceOrThrow(traceFile);
+  const { calls } = await readTraceFile(traceFile, io);
   if (parsed.flags.html) {
     await writeFile(parsed.flags.html, renderReportHtml(calls), "utf8");
     io.writeOut(`Wrote HTML report to ${parsed.flags.html}\n`);
@@ -217,7 +224,7 @@ async function runDiagnose(args: readonly string[], io: CliIo): Promise<number> 
     io.writeErr("Usage: cachelens diagnose <trace.jsonl> [--json]\n");
     return EXIT_ERROR;
   }
-  const calls = await readTraceOrThrow(traceFile);
+  const { calls } = await readTraceFile(traceFile, io);
   const jsonResult = renderDiagnoseJson(calls);
   if (parsed.flags.json) {
     io.writeOut(`${JSON.stringify(jsonResult, null, 2)}\n`);
@@ -239,7 +246,7 @@ async function runCheck(args: readonly string[], io: CliIo): Promise<number> {
     );
     return EXIT_ERROR;
   }
-  const calls = await readTraceOrThrow(traceFile);
+  const { calls } = await readTraceFile(traceFile, io);
   const thresholds = {
     ...(parsed.flags.maxWastedUsd !== undefined ? { maxWastedUsd: parsed.flags.maxWastedUsd } : {}),
     ...(parsed.flags.minHitRatePercent !== undefined
