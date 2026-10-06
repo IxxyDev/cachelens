@@ -1,6 +1,24 @@
 import { type DiagnoseFinding, findAllDiagnoses } from "../core/diagnose/run.js";
 import type { Diagnosis } from "../core/diagnose/taxonomy.js";
 import type { LlmCall } from "../core/model/call.js";
+
+/** One diagnosis pass over a trace; rendered to text or JSON without re-diagnosing. */
+export interface DiagnoseRun {
+  readonly callCount: number;
+  readonly findings: readonly DiagnoseFinding[];
+  /** Reader, pricing and request warnings, already deduplicated. */
+  readonly warnings: readonly string[];
+}
+
+/** Pass `findings` from a diagnosis the caller already ran; otherwise one pass runs here. */
+export function diagnoseTrace(
+  calls: readonly LlmCall[],
+  warnings: readonly string[] = [],
+  findings: readonly DiagnoseFinding[] = findAllDiagnoses(calls)
+): DiagnoseRun {
+  return { callCount: calls.length, findings, warnings };
+}
+
 function renderTierBreakdown(diagnosis: Diagnosis): string[] {
   const byTier = diagnosis.wastedUsdByTier;
   if (diagnosis.invalidatedTiers.length <= 1 || byTier === null) {
@@ -10,13 +28,14 @@ function renderTierBreakdown(diagnosis: Diagnosis): string[] {
     const tierWastedUsd = byTier.get(tier) ?? 0;
     return `    ${tier.padEnd(10)} ~$${tierWastedUsd.toFixed(4)}`;
   });
-  return ["", "  wasted by tier (approximate — see docs):", ...lines];
+  return ["", "  wasted by tier (approximate, see docs/OPERATIONS.md#wasted-by-tier):", ...lines];
 }
+
 function renderFinding(sessionId: string, call: LlmCall, diagnosis: Diagnosis): string {
   const tiers = diagnosis.invalidatedTiers.join("+");
   return [
     `${sessionId} / ${call.stepName} (${call.id})`,
-    `  ${diagnosis.cause} at ${diagnosis.structuralPath} (wire-body offset ${diagnosis.byteOffset}, tier: ${tiers})`,
+    `  ${diagnosis.cause} at ${diagnosis.structuralPath} (canonical offset ${diagnosis.byteOffset}, tier: ${tiers})`,
     "",
     `    ${diagnosis.excerpt}`,
     "",
@@ -25,24 +44,26 @@ function renderFinding(sessionId: string, call: LlmCall, diagnosis: Diagnosis): 
     `  fix: ${diagnosis.recommendation}`
   ].join("\n");
 }
-export function renderDiagnose(calls: readonly LlmCall[]): string {
-  if (calls.length === 0) {
+
+export function renderDiagnose(result: DiagnoseRun): string {
+  if (result.callCount === 0) {
     return "No calls in this trace.\n";
   }
-  const results = findAllDiagnoses(calls);
-  const findings = results.map((r) => renderFinding(r.sessionId, r.call, r.diagnosis));
+  const findings = result.findings.map((r) => renderFinding(r.sessionId, r.call, r.diagnosis));
   if (findings.length === 0) {
     return "cachelens diagnose — no cache-miss root causes found.\n";
   }
   const header = `cachelens diagnose — ${findings.length} finding${findings.length === 1 ? "" : "s"}`;
   return `${[header, ...findings].join("\n\n")}\n`;
 }
+
 export interface DiagnoseFindingJson {
   readonly sessionId: string;
   readonly callId: string;
   readonly stepName: string;
   readonly cause: Diagnosis["cause"];
   readonly invalidatedTiers: Diagnosis["invalidatedTiers"];
+  /** Byte offset into the canonical serialization (tools, system, messages), not the wire body. */
   readonly byteOffset: number;
   readonly structuralPath: string;
   readonly excerpt: string;
@@ -52,6 +73,7 @@ export interface DiagnoseFindingJson {
   readonly wastedUsdByTier: Record<string, number> | null;
   readonly recommendation: string;
 }
+
 function toFindingJson(finding: DiagnoseFinding): DiagnoseFindingJson {
   const { diagnosis } = finding;
   return {
@@ -69,16 +91,20 @@ function toFindingJson(finding: DiagnoseFinding): DiagnoseFindingJson {
     recommendation: diagnosis.recommendation
   };
 }
+
 export interface DiagnoseReportJson {
   readonly callCount: number;
   readonly findingCount: number;
   readonly findings: readonly DiagnoseFindingJson[];
+  /** Reader, pricing and request warnings (unparseable calls, unclassified misses). */
+  readonly warnings: readonly string[];
 }
-export function renderDiagnoseJson(calls: readonly LlmCall[]): DiagnoseReportJson {
-  const findings = findAllDiagnoses(calls);
+
+export function renderDiagnoseJson(result: DiagnoseRun): DiagnoseReportJson {
   return {
-    callCount: calls.length,
-    findingCount: findings.length,
-    findings: findings.map(toFindingJson)
+    callCount: result.callCount,
+    findingCount: result.findings.length,
+    findings: result.findings.map(toFindingJson),
+    warnings: [...result.warnings]
   };
 }

@@ -4,7 +4,7 @@ exports[`renderDiagnose > renders a compiler-style block for a dynamic-prefix-co
 "cachelens diagnose — 1 finding
 
 session-1 / planner (call-2)
-  dynamic-prefix-content at system[0].text (wire-body offset 49, tier: system)
+  dynamic-prefix-content at system[0].text (canonical offset 49, tier: system)
 
     ":"You are an agent. Current time: 2026-11-01T03:30:00Z.","type":"text"}][]
 
@@ -17,13 +17,13 @@ exports[`renderDiagnose > renders a per-tier wasted-$ breakdown for a multi-tier
 "cachelens diagnose — 1 finding
 
 session-1 / planner (call-2)
-  request-param-invalidation at params (wire-body offset 0, tier: tools+system+messages)
+  request-param-invalidation at params (canonical offset 0, tier: tools+system+messages)
 
     model: "claude-sonnet-4-5" -> "claude-opus-4-5"
 
   wasted: 300 tokens (~$0.0017)
 
-  wasted by tier (approximate — see docs):
+  wasted by tier (approximate, see docs/OPERATIONS.md#wasted-by-tier):
     tools      ~$0.0003
     system     ~$0.0010
     messages   ~$0.0004

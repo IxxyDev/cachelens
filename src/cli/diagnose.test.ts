@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import type { Diagnosis } from "../core/diagnose/taxonomy.js";
 import type { LlmCall, RequestParams, Usage } from "../core/model/call.js";
-import { tokenCount } from "../core/model/types.js";
-import { renderDiagnose, renderDiagnoseJson } from "./diagnose.js";
+import { byteOffset, tokenCount, usd } from "../core/model/types.js";
+import { diagnoseTrace, renderDiagnose, renderDiagnoseJson } from "./diagnose.js";
+
 function makeUsage(overrides: Partial<Usage> = {}): Usage {
   return {
     inputTokens: tokenCount(0),
@@ -32,7 +34,7 @@ function makeCall(params: {
 }
 describe("renderDiagnose", () => {
   it("reports no calls for an empty trace", () => {
-    expect(renderDiagnose([])).toBe("No calls in this trace.\n");
+    expect(renderDiagnose(diagnoseTrace([]))).toBe("No calls in this trace.\n");
   });
   it("reports no findings when every pair is healthy", () => {
     const wireBody = { tools: [], system: "x", messages: [] };
@@ -47,7 +49,9 @@ describe("renderDiagnose", () => {
         usage: { cacheReadInputTokens: tokenCount(100) }
       })
     ];
-    expect(renderDiagnose(calls)).toBe("cachelens diagnose — no cache-miss root causes found.\n");
+    expect(renderDiagnose(diagnoseTrace(calls))).toBe(
+      "cachelens diagnose — no cache-miss root causes found.\n"
+    );
   });
   it("renders a compiler-style block for a dynamic-prefix-content finding (snapshot)", () => {
     const calls = [
@@ -76,7 +80,7 @@ describe("renderDiagnose", () => {
         usage: { cacheCreationInputTokens: tokenCount(300) }
       })
     ];
-    expect(renderDiagnose(calls)).toMatchSnapshot();
+    expect(renderDiagnose(diagnoseTrace(calls))).toMatchSnapshot();
   });
   it("renders a per-tier wasted-$ breakdown for a multi-tier finding (tiered counterfactual)", () => {
     const wireBody = {
@@ -104,7 +108,7 @@ describe("renderDiagnose", () => {
         usage: { cacheCreationInputTokens: tokenCount(300) }
       })
     ];
-    const report = renderDiagnose(calls);
+    const report = renderDiagnose(diagnoseTrace(calls));
     expect(report).toContain("wasted by tier");
     expect(report).toMatchSnapshot();
   });
@@ -132,12 +136,17 @@ describe("renderDiagnose", () => {
         usage: { cacheCreationInputTokens: tokenCount(300) }
       })
     ];
-    expect(renderDiagnose(calls)).not.toContain("wasted by tier");
+    expect(renderDiagnose(diagnoseTrace(calls))).not.toContain("wasted by tier");
   });
 });
 describe("renderDiagnoseJson", () => {
   it("returns an empty findings array with counts for an empty trace", () => {
-    expect(renderDiagnoseJson([])).toEqual({ callCount: 0, findingCount: 0, findings: [] });
+    expect(renderDiagnoseJson(diagnoseTrace([]))).toEqual({
+      callCount: 0,
+      findingCount: 0,
+      findings: [],
+      warnings: []
+    });
   });
   it("returns a JSON-safe finding (Map converted to a plain object) for a diagnosed miss", () => {
     const calls = [
@@ -157,7 +166,7 @@ describe("renderDiagnoseJson", () => {
         usage: { cacheCreationInputTokens: tokenCount(50) }
       })
     ];
-    const result = renderDiagnoseJson(calls);
+    const result = renderDiagnoseJson(diagnoseTrace(calls));
     expect(result.callCount).toBe(2);
     expect(result.findingCount).toBe(1);
     expect(result.findings).toHaveLength(1);
@@ -167,5 +176,54 @@ describe("renderDiagnoseJson", () => {
     expect(finding?.cause).toBe("dynamic-prefix-content");
     expect(typeof finding?.wastedUsdByTier).toBe("object");
     expect(() => JSON.stringify(result)).not.toThrow();
+  });
+});
+describe("renderDiagnose wording for hand-built findings", () => {
+  const call = makeCall({
+    id: "c1",
+    sessionId: "s",
+    stepName: "planner",
+    wireBody: {},
+    timestamp: 0
+  });
+  const diagnosis = (overrides: Partial<Diagnosis>): Diagnosis => ({
+    cause: "dynamic-prefix-content",
+    invalidatedTiers: ["system"],
+    byteOffset: byteOffset(12),
+    structuralPath: "system[0].text",
+    excerpt: "Current time: …",
+    wastedTokens: tokenCount(1),
+    wastedUsd: usd(0.5),
+    wastedUsdByTier: new Map(),
+    recommendation: "move the timestamp out of the prefix",
+    ...overrides
+  });
+  it("uses the singular for exactly one finding and one wasted token", () => {
+    const text = renderDiagnose({
+      callCount: 1,
+      findings: [{ sessionId: "s", call, diagnosis: diagnosis({}) }],
+      warnings: []
+    });
+    expect(text).toContain("cachelens diagnose — 1 finding\n");
+    expect(text).toContain("  wasted: 1 token (~$0.5000)");
+  });
+  it("uses the plural for two findings and shows $0 for a tier missing from the breakdown", () => {
+    const multiTier = diagnosis({
+      invalidatedTiers: ["system", "messages"],
+      wastedTokens: tokenCount(40),
+      wastedUsdByTier: new Map([["system", usd(0.25)]])
+    });
+    const text = renderDiagnose({
+      callCount: 2,
+      findings: [
+        { sessionId: "s", call, diagnosis: multiTier },
+        { sessionId: "s", call, diagnosis: diagnosis({}) }
+      ],
+      warnings: []
+    });
+    expect(text).toContain("cachelens diagnose — 2 findings\n");
+    expect(text).toContain("  wasted: 40 tokens");
+    expect(text).toContain("    system     ~$0.2500");
+    expect(text).toContain("    messages   ~$0.0000");
   });
 });
