@@ -1,5 +1,6 @@
 import type { CacheBreakpoint, CacheTtl } from "../model/breakpoint.js";
-import { type Segment, tierSegment } from "../serialize/segment-map.js";
+import type { Segment } from "../serialize/segment-map.js";
+
 interface ParsedRequestBody {
   readonly tools?: unknown;
   readonly system?: unknown;
@@ -22,6 +23,37 @@ function extractTtl(value: unknown): CacheTtl | undefined {
   ).ttl;
   return ttl === "1h" ? "1h" : "5m";
 }
+const BLOCK_PATH = /^(tools|system|messages)\[(\d+)\](?:\.content\[(\d+)\])?$/;
+/**
+ * The automatic breakpoint sits on the last cacheable block: the block-level segment
+ * (tools[i], system[i], messages[i] or messages[i].content[j]) that starts last in the
+ * canonical text, so a message's last content block wins over the enclosing message.
+ */
+function locateAutomaticBreakpoint(
+  ttl: CacheTtl,
+  segments: readonly Segment[]
+): CacheBreakpoint | undefined {
+  let last: { segment: Segment; index: number } | undefined;
+  for (const segment of segments) {
+    const match = BLOCK_PATH.exec(segment.structuralPath);
+    if (!match) continue;
+    if (!last || segment.start > last.segment.start) {
+      last = { segment, index: Number(match[3] ?? match[2]) };
+    }
+  }
+  if (!last) return undefined;
+  return {
+    byteOffset: last.segment.end,
+    index: last.index,
+    ttl,
+    tier: last.segment.tier,
+    kind: "automatic"
+  };
+}
+/**
+ * Offsets refer to the canonical text, which has every `cache_control` marker stripped:
+ * an explicit breakpoint's offset is the end of the block that carried the marker.
+ */
 export function locateBreakpoints(
   wireBody: string,
   segments: readonly Segment[]
@@ -37,41 +69,41 @@ export function locateBreakpoints(
   }
   const body = parsed as ParsedRequestBody;
   const breakpoints: CacheBreakpoint[] = [];
-  if (Array.isArray(body.system)) {
-    body.system.forEach((block, index) => {
-      const ttl = extractTtl(block);
-      if (!ttl) return;
-      const segment = segments.find((s) => s.structuralPath === `system[${index}]`);
-      if (segment) {
-        breakpoints.push({ byteOffset: segment.end, index, ttl, tier: "system" });
-      }
-    });
-  }
+  const pushExplicit = (block: unknown, structuralPath: string, index: number): void => {
+    const ttl = extractTtl(block);
+    if (!ttl) return;
+    const segment = segments.find((s) => s.structuralPath === structuralPath);
+    if (segment) {
+      breakpoints.push({
+        byteOffset: segment.end,
+        index,
+        ttl,
+        tier: segment.tier,
+        kind: "explicit"
+      });
+    }
+  };
   if (Array.isArray(body.tools)) {
-    body.tools.forEach((tool, index) => {
-      const ttl = extractTtl(tool);
-      if (!ttl) return;
-      const segment = tierSegment(segments, "tools");
-      if (segment) {
-        breakpoints.push({ byteOffset: segment.end, index, ttl, tier: "tools" });
-      }
-    });
+    for (const [index, tool] of body.tools.entries()) pushExplicit(tool, `tools[${index}]`, index);
+  }
+  if (Array.isArray(body.system)) {
+    for (const [index, block] of body.system.entries())
+      pushExplicit(block, `system[${index}]`, index);
   }
   if (Array.isArray(body.messages)) {
     body.messages.forEach((message, messageIndex) => {
       if (message === null || typeof message !== "object") return;
       const content = (message as ParsedMessage).content;
       if (!Array.isArray(content)) return;
-      content.forEach((block, blockIndex) => {
-        const ttl = extractTtl(block);
-        if (!ttl) return;
-        const structuralPath = `messages[${messageIndex}].content[${blockIndex}]`;
-        const segment = segments.find((s) => s.structuralPath === structuralPath);
-        if (segment) {
-          breakpoints.push({ byteOffset: segment.end, index: blockIndex, ttl, tier: "messages" });
-        }
-      });
+      for (const [blockIndex, block] of content.entries()) {
+        pushExplicit(block, `messages[${messageIndex}].content[${blockIndex}]`, blockIndex);
+      }
     });
+  }
+  const automaticTtl = extractTtl(body);
+  if (automaticTtl) {
+    const automatic = locateAutomaticBreakpoint(automaticTtl, segments);
+    if (automatic) breakpoints.push(automatic);
   }
   return breakpoints;
 }

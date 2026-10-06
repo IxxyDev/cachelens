@@ -1,5 +1,35 @@
+/**
+ * Canonical serialization policy (applies to `buildCanonicalRequest`):
+ *
+ * 1. Tier order is fixed: tools -> system -> messages. Every other top-level field
+ *    (model, params, top-level `cache_control`, ...) is excluded from the text.
+ * 2. STRUCTURAL objects have their keys sorted lexicographically (`Array.prototype.sort`
+ *    order), recursively: messages[i], system[i], content blocks, tools[i] and their
+ *    nested config. The server parses and re-renders these, so key order there never
+ *    reaches the prompt and must not look like a prefix change.
+ * 3. OPAQUE payloads are serialized verbatim, preserving key order, because the server
+ *    renders them as JSON text into the prompt — key-order drift there is a real cache
+ *    miss (nondeterministic-serialization). Opaque subtrees: tools[i].input_schema,
+ *    a `tool_use` block's `input`, and a `tool_result` block's `content` when it is a
+ *    JSON object (string or block-array content stays structural).
+ * 4. Arrays keep their original element order everywhere.
+ * 5. Redaction placeholders (`[R:<hash>:<N>]`, see src/capture/redact.ts) are padded with
+ *    ASCII "_" to exactly N bytes when N exceeds the placeholder's length, so byte-based
+ *    logic (offsets, tier sizes, min-cacheable proxies) sees the original string size.
+ *    The hash prefix is kept, so distinct texts still diverge. This is exact unless the
+ *    original string needed JSON escapes (quotes, backslashes, control characters).
+ * 6. `cache_control` markers are stripped from the block levels where the vendor
+ *    accepts them (tools[i], system[i], messages[i].content[j], and blocks nested in a
+ *    tool_result's content array). They mark where the cached prefix ends but are not
+ *    part of the cached content, so moving a breakpoint must not look like a prefix
+ *    change. Breakpoints are located separately by `locateBreakpoints`, against offsets
+ *    in this marker-free text.
+ */
+import { normalizeSortedKeys } from "../diff/normalize.js";
+import { REDACTION_PLACEHOLDER_RE } from "../model/redaction.js";
+import type { CacheTier } from "../model/tier.js";
 import { byteOffset } from "../model/types.js";
-import { type Segment, byteLengthUtf8 } from "./segment-map.js";
+import { byteLengthUtf8, type Segment } from "./segment-map.js";
 export class CanonicalRequestParseError extends Error {
   constructor(cause: unknown) {
     super(
@@ -44,6 +74,28 @@ function parseWireBody(wireBody: string): ParsedRequestBody {
   }
   return parsed as ParsedRequestBody;
 }
+function expandRedactionPlaceholder(value: string): string {
+  if (!REDACTION_PLACEHOLDER_RE.test(value)) return value;
+  const originalBytes = Number(value.slice(value.lastIndexOf(":") + 1, -1));
+  return originalBytes > value.length ? value.padEnd(originalBytes, "_") : value;
+}
+/** JSON.stringify that keeps key order and expands redaction placeholders to their original size. */
+function stringifyLeaves(value: unknown): string {
+  return JSON.stringify(value, (_key, leaf: unknown) =>
+    typeof leaf === "string" ? expandRedactionPlaceholder(leaf) : leaf
+  );
+}
+function canonicalJson(value: unknown): string {
+  return stringifyLeaves(normalizeSortedKeys(value));
+}
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function withoutCacheControl(block: unknown): unknown {
+  if (!isPlainObject(block) || !("cache_control" in block)) return block;
+  const { cache_control: _marker, ...rest } = block;
+  return rest;
+}
 export function canonicalPrefixComparisonText(canonical: CanonicalRequest): string {
   return canonical.text.endsWith("]") ? canonical.text.slice(0, -1) : canonical.text;
 }
@@ -52,7 +104,7 @@ export function buildCanonicalRequest(wireBody: string): CanonicalRequest {
   const writer = new OffsetWriter();
   const segments: Segment[] = [];
   const toolsStart = writer.currentOffset;
-  writer.push(JSON.stringify(parsed.tools ?? []));
+  writeBlockArray(parsed.tools ?? [], "tools", writer, segments, writeTool);
   segments.push({
     start: byteOffset(toolsStart),
     end: byteOffset(writer.currentOffset),
@@ -60,7 +112,7 @@ export function buildCanonicalRequest(wireBody: string): CanonicalRequest {
     structuralPath: "tools"
   });
   const systemStart = writer.currentOffset;
-  writeSystem(parsed.system, writer, segments);
+  writeBlockArray(parsed.system ?? null, "system", writer, segments, writeSystemBlock);
   segments.push({
     start: byteOffset(systemStart),
     end: byteOffset(writer.currentOffset),
@@ -68,7 +120,7 @@ export function buildCanonicalRequest(wireBody: string): CanonicalRequest {
     structuralPath: "system"
   });
   const messagesStart = writer.currentOffset;
-  writeMessages(parsed.messages, writer, segments);
+  writeBlockArray(parsed.messages ?? [], "messages", writer, segments, writeMessage);
   segments.push({
     start: byteOffset(messagesStart),
     end: byteOffset(writer.currentOffset),
@@ -77,124 +129,137 @@ export function buildCanonicalRequest(wireBody: string): CanonicalRequest {
   });
   return { text: writer.text, byteLength: writer.currentOffset, segments };
 }
-function writeMessages(messages: unknown, writer: OffsetWriter, segments: Segment[]): void {
-  if (!Array.isArray(messages)) {
-    writer.push(JSON.stringify(messages ?? []));
+type BlockWriter = (
+  block: unknown,
+  writer: OffsetWriter,
+  segments: Segment[],
+  tier: CacheTier,
+  structuralPath: string
+) => void;
+/** Writes `value` as an array with one `${path}[i]` segment per element; non-arrays pass through. */
+function writeBlockArray(
+  value: unknown,
+  path: string,
+  writer: OffsetWriter,
+  segments: Segment[],
+  writeBlock: BlockWriter,
+  tier: CacheTier = path as CacheTier
+): void {
+  if (!Array.isArray(value)) {
+    writer.push(canonicalJson(value));
     return;
   }
   writer.push("[");
-  messages.forEach((message, index) => {
+  value.forEach((block, index) => {
     if (index > 0) writer.push(",");
-    const messageStart = writer.currentOffset;
-    writeMessage(message, writer, segments, index);
+    const blockStart = writer.currentOffset;
+    const structuralPath = `${path}[${index}]`;
+    writeBlock(block, writer, segments, tier, structuralPath);
     segments.push({
-      start: byteOffset(messageStart),
+      start: byteOffset(blockStart),
       end: byteOffset(writer.currentOffset),
-      tier: "messages",
-      structuralPath: `messages[${index}]`
+      tier,
+      structuralPath
     });
   });
   writer.push("]");
+}
+/**
+ * Rebuilds a structural block with sorted keys and no `cache_control`; values for which
+ * `isOpaque` returns true are kept as-is (original key order), the rest are key-sorted.
+ */
+function structuralBlock(
+  block: unknown,
+  isOpaque: (key: string, value: unknown, blockType: unknown) => boolean,
+  canonicalValue: (key: string, value: unknown) => unknown = (_key, value) =>
+    normalizeSortedKeys(value)
+): unknown {
+  const stripped = withoutCacheControl(block);
+  if (!isPlainObject(stripped)) return normalizeSortedKeys(stripped);
+  const { type: blockType } = stripped;
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(stripped).sort()) {
+    const value = stripped[key];
+    result[key] = isOpaque(key, value, blockType) ? value : canonicalValue(key, value);
+  }
+  return result;
+}
+function canonicalTool(tool: unknown): unknown {
+  return structuralBlock(tool, (key) => key === "input_schema");
+}
+function canonicalContentBlock(block: unknown): unknown {
+  return structuralBlock(
+    block,
+    (key, value, blockType) =>
+      (blockType === "tool_use" && key === "input") ||
+      (blockType === "tool_result" && key === "content" && isPlainObject(value)),
+    (key, value) =>
+      key === "content" && Array.isArray(value)
+        ? value.map(canonicalContentBlock)
+        : normalizeSortedKeys(value)
+  );
+}
+function writeTool(tool: unknown, writer: OffsetWriter): void {
+  writer.push(stringifyLeaves(canonicalTool(tool)));
+}
+function writeContentBlock(block: unknown, writer: OffsetWriter): void {
+  writer.push(stringifyLeaves(canonicalContentBlock(block)));
+}
+/** Writes an object with sorted keys, letting `writeValue` claim specific keys. */
+function writeSortedObject(
+  obj: Record<string, unknown>,
+  writer: OffsetWriter,
+  writeValue: (key: string, value: unknown) => boolean
+): void {
+  writer.push("{");
+  Object.keys(obj)
+    .sort()
+    .forEach((key, i) => {
+      if (i > 0) writer.push(",");
+      writer.push(`${JSON.stringify(key)}:`);
+      if (!writeValue(key, obj[key])) writer.push(canonicalJson(obj[key]));
+    });
+  writer.push("}");
 }
 function writeMessage(
   message: unknown,
   writer: OffsetWriter,
   segments: Segment[],
-  messageIndex: number
+  tier: CacheTier,
+  structuralPath: string
 ): void {
-  if (message === null || typeof message !== "object") {
-    writer.push(JSON.stringify(message));
+  if (!isPlainObject(message)) {
+    writer.push(canonicalJson(message));
     return;
   }
-  const obj = message as Record<string, unknown>;
-  const priorityKeys = ["role", "content"];
-  const remainingKeys = Object.keys(obj)
-    .filter((key) => !priorityKeys.includes(key))
-    .sort();
-  const orderedKeys = [...priorityKeys, ...remainingKeys].filter((key) => key in obj);
-  writer.push("{");
-  orderedKeys.forEach((key, i) => {
-    if (i > 0) writer.push(",");
-    writer.push(`${JSON.stringify(key)}:`);
-    if (key === "content" && Array.isArray(obj[key])) {
-      writeContentBlocks(obj[key] as unknown[], writer, segments, messageIndex);
-    } else {
-      writer.push(JSON.stringify(obj[key]));
-    }
+  writeSortedObject(message, writer, (key, value) => {
+    if (key !== "content" || !Array.isArray(value)) return false;
+    writeBlockArray(value, `${structuralPath}.content`, writer, segments, writeContentBlock, tier);
+    return true;
   });
-  writer.push("}");
-}
-function writeContentBlocks(
-  blocks: readonly unknown[],
-  writer: OffsetWriter,
-  segments: Segment[],
-  messageIndex: number
-): void {
-  writer.push("[");
-  blocks.forEach((block, index) => {
-    if (index > 0) writer.push(",");
-    const blockStart = writer.currentOffset;
-    writer.push(JSON.stringify(block));
-    segments.push({
-      start: byteOffset(blockStart),
-      end: byteOffset(writer.currentOffset),
-      tier: "messages",
-      structuralPath: `messages[${messageIndex}].content[${index}]`
-    });
-  });
-  writer.push("]");
-}
-function writeSystem(system: unknown, writer: OffsetWriter, segments: Segment[]): void {
-  if (!Array.isArray(system)) {
-    writer.push(JSON.stringify(system ?? null));
-    return;
-  }
-  writer.push("[");
-  system.forEach((block, index) => {
-    if (index > 0) writer.push(",");
-    const blockStart = writer.currentOffset;
-    writeSystemBlock(block, writer, segments, index);
-    segments.push({
-      start: byteOffset(blockStart),
-      end: byteOffset(writer.currentOffset),
-      tier: "system",
-      structuralPath: `system[${index}]`
-    });
-  });
-  writer.push("]");
 }
 function writeSystemBlock(
   block: unknown,
   writer: OffsetWriter,
   segments: Segment[],
-  index: number
+  tier: CacheTier,
+  structuralPath: string
 ): void {
-  if (block === null || typeof block !== "object") {
-    writer.push(JSON.stringify(block));
+  const stripped = withoutCacheControl(block);
+  if (!isPlainObject(stripped)) {
+    writer.push(canonicalJson(stripped));
     return;
   }
-  const obj = block as Record<string, unknown>;
-  const priorityKeys = ["type", "text", "cache_control"];
-  const remainingKeys = Object.keys(obj)
-    .filter((key) => !priorityKeys.includes(key))
-    .sort();
-  const orderedKeys = [...priorityKeys, ...remainingKeys].filter((key) => key in obj);
-  writer.push("{");
-  orderedKeys.forEach((key, i) => {
-    if (i > 0) writer.push(",");
-    writer.push(`${JSON.stringify(key)}:`);
-    if (key === "text" && typeof obj[key] === "string") {
-      const valueStart = writer.currentOffset;
-      writer.push(JSON.stringify(obj[key]));
-      segments.push({
-        start: byteOffset(valueStart),
-        end: byteOffset(writer.currentOffset),
-        tier: "system",
-        structuralPath: `system[${index}].text`
-      });
-    } else {
-      writer.push(JSON.stringify(obj[key]));
-    }
+  writeSortedObject(stripped, writer, (key, value) => {
+    if (key !== "text" || typeof value !== "string") return false;
+    const valueStart = writer.currentOffset;
+    writer.push(stringifyLeaves(value));
+    segments.push({
+      start: byteOffset(valueStart),
+      end: byteOffset(writer.currentOffset),
+      tier,
+      structuralPath: `${structuralPath}.text`
+    });
+    return true;
   });
-  writer.push("}");
 }

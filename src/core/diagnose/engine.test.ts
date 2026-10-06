@@ -190,9 +190,12 @@ describe("diagnoseCall", () => {
     expect(result.diagnosis.invalidatedTiers).toEqual(["system", "messages"]);
   });
   it("detects nondeterministic-serialization when only tool key order differs", () => {
+    const makeTools = (schema: Record<string, unknown>) => [
+      { name: "search", description: "x", input_schema: schema }
+    ];
     const previous = makeCall({
       wireBody: {
-        tools: [{ name: "search", description: "x" }],
+        tools: makeTools({ type: "object", properties: { q: { type: "string" } } }),
         system: "s",
         messages: []
       },
@@ -201,7 +204,7 @@ describe("diagnoseCall", () => {
     });
     const current = makeCall({
       wireBody: {
-        tools: [{ description: "x", name: "search" }],
+        tools: makeTools({ properties: { q: { type: "string" } }, type: "object" }),
         system: "s",
         messages: []
       },
@@ -213,6 +216,20 @@ describe("diagnoseCall", () => {
     if (result.kind !== "diagnosis") throw new Error("expected a diagnosis");
     expect(result.diagnosis.cause).toBe("nondeterministic-serialization");
     expect(result.diagnosis.invalidatedTiers).toEqual(["tools"]);
+  });
+  it("structural tool key order alone does not diverge the prefix", () => {
+    const previous = makeCall({
+      wireBody: { tools: [{ name: "search", description: "x" }], system: "s", messages: [] },
+      timestamp: 0,
+      usage: { cacheReadInputTokens: tokenCount(300) }
+    });
+    const current = makeCall({
+      wireBody: { tools: [{ description: "x", name: "search" }], system: "s", messages: [] },
+      timestamp: GAP_MS,
+      usage: { cacheCreationInputTokens: tokenCount(300) }
+    });
+    const result = diagnoseCall(previous, current);
+    expect(result.kind).toBe("unclassified-miss");
   });
   it("falls back to dynamic-prefix-content with an exact byteOffset and structuralPath for a timestamp change", () => {
     const previousTimestamp = "2026-07-24T10:00:00Z";
@@ -633,21 +650,19 @@ describe("diagnoseCall", () => {
   it("overlap: nondeterministic-serialization wins over a misplacement-shaped signature", () => {
     const longStableText = "S".repeat(4200);
     const system = [{ type: "text", text: longStableText, cache_control: { type: "ephemeral" } }];
+    const makeMessages = (schemaLikeInput: Record<string, unknown>) => [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "t1", name: "search", input: schemaLikeInput }]
+      }
+    ];
     const previous = makeCall({
-      wireBody: {
-        tools: [],
-        system,
-        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
-      },
+      wireBody: { tools: [], system, messages: makeMessages({ a: 1, b: 2 }) },
       timestamp: 0,
       usage: { cacheReadInputTokens: tokenCount(300) }
     });
     const current = makeCall({
-      wireBody: {
-        tools: [],
-        system,
-        messages: [{ role: "user", content: [{ text: "hi", type: "text" }] }]
-      },
+      wireBody: { tools: [], system, messages: makeMessages({ b: 2, a: 1 }) },
       timestamp: GAP_MS,
       usage: { cacheCreationInputTokens: tokenCount(300) }
     });

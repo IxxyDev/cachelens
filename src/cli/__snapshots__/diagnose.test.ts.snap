@@ -4,12 +4,12 @@ exports[`renderDiagnose > renders a compiler-style block for a dynamic-prefix-co
 "cachelens diagnose — 1 finding
 
 session-1 / planner (call-2)
-  dynamic-prefix-content at system[0].text (wire-body offset 63, tier: system)
+  dynamic-prefix-content at system[0].text (wire-body offset 49, tier: system)
 
-    ":"You are an agent. Current time: 2026-11-01T03:30:00Z."}][]
+    ":"You are an agent. Current time: 2026-11-01T03:30:00Z.","type":"text"}][]
 
   wasted: 300 tokens (~$0.0010)
-  fix: Move the dynamic content at system[0].text (wire-body offset 63) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.
+  fix: Move the dynamic content at system[0].text (wire-body offset 49) after the last stable cache breakpoint, or exclude it from the cached prefix entirely.
 "
 `;
 
